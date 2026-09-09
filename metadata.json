@@ -1,0 +1,7 @@
+{
+  "name": "Çanakkale: Büyük Kumandan",
+  "description": "2D piksel art, gece-gündüz döngülü, siper kazma ve tarihi Çanakkale cephesi strateji savunma oyunu.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
+

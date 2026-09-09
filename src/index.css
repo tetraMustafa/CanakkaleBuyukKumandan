@@ -1,0 +1,52 @@
+@import "tailwindcss";
+
+@layer base {
+  * {
+    image-rendering: pixelated;
+    -webkit-font-smoothing: antialiased;
+  }
+}
+
+.font-cinzel {
+  font-family: 'Cinzel', serif;
+}
+
+.font-pixel {
+  font-family: 'Press Start 2P', monospace;
+}
+
+.font-sans {
+  font-family: 'Plus Jakarta Sans', sans-serif;
+}
+
+/* Custom glowing and pixel art aesthetics */
+.pixel-border {
+  box-shadow: 
+    0 -3px 0 0 #292524,
+    0 3px 0 0 #292524,
+    -3px 0 0 0 #292524,
+    3px 0 0 0 #292524,
+    0 0 0 2px #78350f;
+}
+
+.pixel-border-gold {
+  box-shadow: 
+    0 -3px 0 0 #451a03,
+    0 3px 0 0 #451a03,
+    -3px 0 0 0 #451a03,
+    3px 0 0 0 #451a03,
+    0 0 0 2px #d97706;
+}
+
+/* Scanlines and Vignette overlay */
+.crt-overlay {
+  background: linear-gradient(rgba(18, 16, 16, 0) 50%, rgba(0, 0, 0, 0.25) 50%), linear-gradient(90deg, rgba(255, 0, 0, 0.03), rgba(0, 255, 0, 0.01), rgba(0, 0, 255, 0.03));
+  background-size: 100% 3px, 4px 100%;
+  pointer-events: none;
+}
+
+.vignette-overlay {
+  box-shadow: inset 0 0 100px rgba(0, 0, 0, 0.7);
+  pointer-events: none;
+}
+
