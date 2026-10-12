@@ -13,10 +13,21 @@ class SoundEngine {
   private musicGain: GainNode | null = null;
   private sfxGain: GainNode | null = null;
   private ambienceGain: GainNode | null = null;
+  private rainGain: GainNode | null = null;
+  private fogGain: GainNode | null = null;
+  private currentRainVol: number = 0;
+  private currentFogVol: number = 0;
   private isMuted: boolean = false;
   private currentMusicType: 'day' | 'night' | 'victory' | 'defeat' | 'none' = 'none';
   private musicInterval: number | null = null;
   private ambienceInterval: number | null = null;
+
+  // Static Audio File Cache & Menu Music Source
+  private bufferCache: Map<string, AudioBuffer> = new Map();
+  private pendingFetches: Map<string, Promise<AudioBuffer | null>> = new Map();
+  private menuMusicSource: AudioBufferSourceNode | null = null;
+  private menuMusicGain: GainNode | null = null;
+  private isMenuMusicPlaying: boolean = false;
 
   constructor() {
     // Lazy initialized on first user interaction
@@ -31,19 +42,119 @@ class SoundEngine {
       this.musicGain = this.ctx.createGain();
       this.sfxGain = this.ctx.createGain();
       this.ambienceGain = this.ctx.createGain();
+      this.rainGain = this.ctx.createGain();
+      this.fogGain = this.ctx.createGain();
 
       this.musicGain.gain.setValueAtTime(0.32, this.ctx.currentTime);
       this.sfxGain.gain.setValueAtTime(0.48, this.ctx.currentTime);
       this.ambienceGain.gain.setValueAtTime(0.2, this.ctx.currentTime);
+      this.rainGain.gain.setValueAtTime(0, this.ctx.currentTime);
+      this.fogGain.gain.setValueAtTime(0, this.ctx.currentTime);
 
       this.musicGain.connect(this.ctx.destination);
       this.sfxGain.connect(this.ctx.destination);
       this.ambienceGain.connect(this.ctx.destination);
+      this.rainGain.connect(this.ctx.destination);
+      this.fogGain.connect(this.ctx.destination);
 
       this.startAmbientSeaBreeze();
+      this.startRainAmbience();
+      this.startFogAmbience();
+      this.preloadCommonSounds();
     } catch {
       console.warn('AudioContext not supported in this browser');
     }
+  }
+
+  public async preloadCommonSounds() {
+    const commonUrls = [
+      '/audio/music/main_theme.wav',
+      '/audio/sfx/coin_pickup.wav',
+      '/audio/sfx/coin_pay.wav',
+      '/audio/sfx/gunshot_rifle.wav',
+      '/audio/sfx/gunshot_mg.wav',
+      '/audio/sfx/explosion.wav',
+      '/audio/sfx/whistle.wav',
+      '/audio/sfx/bugle_charge.wav',
+      '/audio/sfx/radio_chatter.wav',
+      '/audio/sfx/radio_decode.wav',
+    ];
+    for (const url of commonUrls) {
+      this.loadAudioBuffer(url).catch(() => {});
+    }
+  }
+
+  public async loadAudioBuffer(url: string): Promise<AudioBuffer | null> {
+    if (this.bufferCache.has(url)) return this.bufferCache.get(url)!;
+    if (this.pendingFetches.has(url)) return this.pendingFetches.get(url)!;
+
+    const fetchPromise = (async () => {
+      try {
+        const res = await fetch(url);
+        if (!res.ok) return null;
+        const arrayBuf = await res.arrayBuffer();
+        if (!this.ctx) this.init();
+        if (!this.ctx) return null;
+        const audioBuf = await this.ctx.decodeAudioData(arrayBuf);
+        this.bufferCache.set(url, audioBuf);
+        return audioBuf;
+      } catch {
+        return null;
+      } finally {
+        this.pendingFetches.delete(url);
+      }
+    })();
+
+    this.pendingFetches.set(url, fetchPromise);
+    return fetchPromise;
+  }
+
+  public playFileSound(url: string, gain: number = 1.0, loop: boolean = false, fallbackFn?: () => void): boolean {
+    if (this.isMuted) return false;
+    this.resume();
+    if (!this.ctx || !this.sfxGain) {
+      if (fallbackFn) fallbackFn();
+      return false;
+    }
+
+    const cached = this.bufferCache.get(url);
+    if (cached) {
+      try {
+        const src = this.ctx.createBufferSource();
+        src.buffer = cached;
+        src.loop = loop;
+        const g = this.ctx.createGain();
+        g.gain.setValueAtTime(gain, this.ctx.currentTime);
+        src.connect(g);
+        g.connect(this.sfxGain);
+        src.start();
+        return true;
+      } catch {
+        if (fallbackFn) fallbackFn();
+        return false;
+      }
+    } else {
+      this.loadAudioBuffer(url);
+      if (fallbackFn) fallbackFn();
+      return false;
+    }
+  }
+
+  // --- Main Menu Theme (Flowing, peaceful procedural Ottoman theme) ---
+  public async playMenuMusic() {
+    this.stopMusic();
+    if (this.isMenuMusicPlaying) return;
+    this.isMenuMusicPlaying = true;
+    this.resume();
+    if (!this.ctx || !this.musicGain) return;
+
+    this.currentMusicType = 'day';
+    this.startKingdomDaytimeAmbiance();
+  }
+
+  public stopMenuMusic() {
+    this.isMenuMusicPlaying = false;
+    this.stopMusic();
   }
 
   public resume() {
@@ -61,6 +172,8 @@ class SoundEngine {
     if (this.musicGain) this.musicGain.gain.setValueAtTime(muted ? 0 : 0.32, this.ctx.currentTime);
     if (this.sfxGain) this.sfxGain.gain.setValueAtTime(muted ? 0 : 0.48, this.ctx.currentTime);
     if (this.ambienceGain) this.ambienceGain.gain.setValueAtTime(muted ? 0 : 0.2, this.ctx.currentTime);
+    if (this.rainGain) this.rainGain.gain.setValueAtTime(muted ? 0 : this.currentRainVol, this.ctx.currentTime);
+    if (this.fogGain) this.fogGain.gain.setValueAtTime(muted ? 0 : this.currentFogVol, this.ctx.currentTime);
   }
 
   public getIsMuted() {
@@ -415,6 +528,28 @@ class SoundEngine {
     }
   }
 
+  // Radio Chatter (WWI Morse Code & Wireless Intercept)
+  public playRadioChatter() {
+    if (!this.ctx || !this.sfxGain || this.isMuted) return;
+    this.resume();
+    const t = this.ctx.currentTime;
+    const osc = this.ctx.createOscillator();
+    const gain = this.ctx.createGain();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(840, t);
+    gain.gain.setValueAtTime(0.28, t);
+    gain.gain.exponentialRampToValueAtTime(0.01, t + 0.6);
+    osc.connect(gain);
+    gain.connect(this.sfxGain);
+    osc.start(t);
+    osc.stop(t + 0.6);
+  }
+
+  // Radio Decode (Successful decryption fanfare & chime)
+  public playRadioDecode() {
+    this.playVictoryFanfare();
+  }
+
   // --- Sound Effects (SFX) ---
 
   // Crisp Kingdom-style Coin Pickup / Collect
@@ -515,6 +650,24 @@ class SoundEngine {
     this.playCoinDrop();
   }
 
+  // Medical Treatment / Heal Sound
+  public playHeal() {
+    if (this.isMuted || !this.ctx || !this.sfxGain) return;
+    this.resume();
+    const t = this.ctx.currentTime;
+    const osc = this.ctx.createOscillator();
+    const gain = this.ctx.createGain();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(440, t);
+    osc.frequency.exponentialRampToValueAtTime(880, t + 0.25);
+    gain.gain.setValueAtTime(0.2, t);
+    gain.gain.exponentialRampToValueAtTime(0.001, t + 0.3);
+    osc.connect(gain);
+    gain.connect(this.sfxGain);
+    osc.start(t);
+    osc.stop(t + 0.3);
+  }
+
   public playWhistle() {
     if (this.isMuted || !this.ctx || !this.sfxGain) return;
     this.resume();
@@ -556,7 +709,7 @@ class SoundEngine {
 
     const gain = this.ctx.createGain();
     gain.gain.setValueAtTime(isMachineGun ? 0.22 : 0.4, t);
-    gain.gain.exponentialRampToValueAtTime(0.001, t + (isMachineGun ? 0.08 : 0.25));
+    gain.gain.exponentialRampToValueAtTime(0.001, t + (isMachineGun ? 0.09 : 0.3));
 
     noise.connect(filter);
     filter.connect(gain);
@@ -911,6 +1064,29 @@ class SoundEngine {
     osc.stop(t + 0.22);
   }
 
+  public playRicochet() {
+    if (this.isMuted || !this.ctx || !this.sfxGain) return;
+    this.resume();
+    const t = this.ctx.currentTime;
+    const osc = this.ctx.createOscillator();
+    const gain = this.ctx.createGain();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(2400 + Math.random() * 600, t);
+    osc.frequency.exponentialRampToValueAtTime(1100, t + 0.12);
+    gain.gain.setValueAtTime(0.28, t);
+    gain.gain.exponentialRampToValueAtTime(0.001, t + 0.16);
+    osc.connect(gain);
+    gain.connect(this.sfxGain);
+    osc.start(t);
+    osc.stop(t + 0.16);
+  }
+
+  public playArmorEquip() {
+    if (this.isMuted || !this.ctx || !this.sfxGain) return;
+    this.resume();
+    this.playHammer('metal');
+  }
+
   public playReload() {
     if (this.isMuted || !this.ctx || !this.sfxGain) return;
     this.resume();
@@ -973,57 +1149,95 @@ class SoundEngine {
   }
 
   public playAssaultShout() {
-    if (this.isMuted || !this.ctx || !this.sfxGain) return;
-    this.resume();
-    
-    // Bugle fanfare charge
     this.playBugleCharge();
+  }
 
-    // Rhythmic Marching Infantry Footsteps & Snare Drum Rolls
-    for (let step = 0; step < 8; step++) {
-      setTimeout(() => {
-        if (!this.ctx || !this.sfxGain) return;
-        const t = this.ctx.currentTime;
+  private startRainAmbience() {
+    // Ultra-performant procedural soft rainfall using filtered pink/white noise buffer
+    if (!this.ctx || !this.rainGain) return;
+    try {
+      const bufferSize = this.ctx.sampleRate * 2.5;
+      const buffer = this.ctx.createBuffer(1, bufferSize, this.ctx.sampleRate);
+      const data = buffer.getChannelData(0);
+      let lastVal = 0;
+      for (let i = 0; i < bufferSize; i++) {
+        // High-frequency rain hiss + subtle droplet patters
+        const white = Math.random() * 2 - 1;
+        lastVal = lastVal * 0.85 + white * 0.15;
+        // Occasional water droplet ping in rain buffer
+        const droplet = (Math.random() < 0.0015) ? (Math.random() * 0.6) : 0;
+        data[i] = lastVal * 0.45 + droplet;
+      }
 
-        // Snare drum snap
-        const noiseBuffer = this.ctx.createBuffer(1, this.ctx.sampleRate * 0.05, this.ctx.sampleRate);
-        const output = noiseBuffer.getChannelData(0);
-        for (let i = 0; i < noiseBuffer.length; i++) {
-          output[i] = Math.random() * 2 - 1;
-        }
-        const whiteNoise = this.ctx.createBufferSource();
-        whiteNoise.buffer = noiseBuffer;
-        const filter = this.ctx.createBiquadFilter();
-        filter.type = 'highpass';
-        filter.frequency.value = 1000;
-        const noiseGain = this.ctx.createGain();
-        noiseGain.gain.setValueAtTime(0.2, t);
-        noiseGain.gain.exponentialRampToValueAtTime(0.01, t + 0.04);
+      const rainSource = this.ctx.createBufferSource();
+      rainSource.buffer = buffer;
+      rainSource.loop = true;
 
-        whiteNoise.connect(filter);
-        filter.connect(noiseGain);
-        noiseGain.connect(this.sfxGain);
-        whiteNoise.start(t);
+      const rainFilter = this.ctx.createBiquadFilter();
+      rainFilter.type = 'bandpass';
+      rainFilter.frequency.setValueAtTime(1450, this.ctx.currentTime);
+      rainFilter.Q.setValueAtTime(0.7, this.ctx.currentTime);
 
-        // Heavy Boot thud
-        const osc = this.ctx.createOscillator();
-        const bootGain = this.ctx.createGain();
-        osc.frequency.setValueAtTime(110, t);
-        osc.frequency.exponentialRampToValueAtTime(35, t + 0.08);
-        bootGain.gain.setValueAtTime(0.3, t);
-        bootGain.gain.exponentialRampToValueAtTime(0.01, t + 0.08);
-        osc.connect(bootGain);
-        bootGain.connect(this.sfxGain);
-        osc.start(t);
-        osc.stop(t + 0.08);
-      }, step * 160);
+      rainSource.connect(rainFilter);
+      rainFilter.connect(this.rainGain);
+      rainSource.start();
+    } catch {
+      // ignore
+    }
+  }
+
+  private startFogAmbience() {
+    // Atmospheric low mountain mist / Gallipoli coastal breeze drone
+    if (!this.ctx || !this.fogGain) return;
+    try {
+      const bufferSize = this.ctx.sampleRate * 3;
+      const buffer = this.ctx.createBuffer(1, bufferSize, this.ctx.sampleRate);
+      const data = buffer.getChannelData(0);
+      let b0 = 0, b1 = 0;
+      for (let i = 0; i < bufferSize; i++) {
+        const white = Math.random() * 2 - 1;
+        b0 = 0.995 * b0 + white * 0.05;
+        b1 = 0.985 * b1 + white * 0.07;
+        data[i] = (b0 + b1) * 0.18;
+      }
+
+      const fogSource = this.ctx.createBufferSource();
+      fogSource.buffer = buffer;
+      fogSource.loop = true;
+
+      const fogFilter = this.ctx.createBiquadFilter();
+      fogFilter.type = 'lowpass';
+      fogFilter.frequency.setValueAtTime(320, this.ctx.currentTime);
+
+      fogSource.connect(fogFilter);
+      fogFilter.connect(this.fogGain);
+      fogSource.start();
+    } catch {
+      // ignore
     }
   }
 
   public updateWeatherAmbience(weather: 'clear' | 'rain' | 'fog' | 'storm' | 'snow', intensity: number) {
-    if (!this.ctx || !this.ambienceGain) return;
-    if (weather === 'rain' || weather === 'storm') {
-      this.ambienceGain.gain.setValueAtTime(Math.min(0.3, 0.15 + intensity * 0.15), this.ctx.currentTime);
+    if (!this.ctx || !this.rainGain || !this.fogGain) return;
+    const t = this.ctx.currentTime;
+    const targetRain = (weather === 'rain' || weather === 'storm')
+      ? Math.min(0.35, 0.12 + intensity * 0.20)
+      : 0;
+    const targetFog = (weather === 'fog')
+      ? Math.min(0.28, 0.10 + intensity * 0.16)
+      : (weather === 'storm' ? 0.08 : 0);
+
+    this.currentRainVol = targetRain;
+    this.currentFogVol = targetFog;
+
+    if (!this.isMuted) {
+      this.rainGain.gain.cancelScheduledValues(t);
+      this.rainGain.gain.setValueAtTime(this.rainGain.gain.value, t);
+      this.rainGain.gain.linearRampToValueAtTime(targetRain, t + 1.8);
+
+      this.fogGain.gain.cancelScheduledValues(t);
+      this.fogGain.gain.setValueAtTime(this.fogGain.gain.value, t);
+      this.fogGain.gain.linearRampToValueAtTime(targetFog, t + 2.2);
     }
   }
 }

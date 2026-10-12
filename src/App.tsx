@@ -8,15 +8,25 @@ import { GameEngine } from './engine/gameLoop';
 import { GameRenderer } from './engine/renderer';
 import { soundEngine } from './audio/soundEngine';
 import { HUD } from './components/HUD';
-import { CommanderControls } from './components/CommanderControls';
 import { VictoryModal } from './components/VictoryModal';
 import { DefeatModal } from './components/DefeatModal';
 import { CampaignMap } from './components/CampaignMap';
 import { EncyclopediaModal } from './components/EncyclopediaModal';
 import { HowToPlayModal } from './components/HowToPlayModal';
+import { LevelLoadingScreen } from './components/LevelLoadingScreen';
+import { RadioTelegraphModal } from './components/RadioTelegraphModal';
 import { CAMPAIGN_LEVELS } from './data/levels';
-import { recordLevelScore } from './utils/storage';
-import { Shield, Play, BookOpen, Map, Volume2, VolumeX, Sparkles, HelpCircle, ChevronDown, Radio } from 'lucide-react';
+import {
+  recordLevelScore,
+  getUnlockedLevel,
+  setUnlockedLevel as setStoredUnlockedLevel,
+  getSelectedLevel,
+  setSelectedLevel as setStoredSelectedLevel,
+  resetCampaignProgress,
+  hasSeenChapter1Tutorial,
+  setSeenChapter1Tutorial
+} from './utils/storage';
+import { Shield, Play, BookOpen, Map, Volume2, VolumeX, Sparkles, HelpCircle, ChevronDown, ChevronLeft, ChevronRight, Radio, RotateCcw } from 'lucide-react';
 
 export default function App() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -32,39 +42,64 @@ export default function App() {
   // React states for UI synchronization
   const [inMainMenu, setInMainMenu] = useState<boolean>(true);
   const [currentLevelIndex, setCurrentLevelIndex] = useState<number>(0);
-  const [unlockedLevel, setUnlockedLevel] = useState<number>(() => {
-    try {
-      const saved = localStorage.getItem('canakkale_unlocked_level');
-      return saved ? parseInt(saved, 10) : 0;
-    } catch {
-      return 0;
-    }
-  });
+  const [unlockedLevel, setUnlockedLevelState] = useState<number>(() => getUnlockedLevel());
+  const [selectedLevelIndex, setSelectedLevelIndex] = useState<number>(() => getSelectedLevel());
 
   const [showMap, setShowMap] = useState<boolean>(false);
   const [showCodex, setShowCodex] = useState<boolean>(false);
   const [showHelp, setShowHelp] = useState<boolean>(false);
   const [isMuted, setIsMuted] = useState<boolean>(false);
   const [isObjectivesExpanded, setIsObjectivesExpanded] = useState<boolean>(true);
+  const [isLoadingLevel, setIsLoadingLevel] = useState<boolean>(false);
+  const [pendingLevelIndex, setPendingLevelIndex] = useState<number>(0);
 
   // Synced game state for React HUD
   const [, setTick] = useState<number>(0);
   const carriedTroopsRef = useRef<Array<{ role: import('./types/game').Soldier['role']; name?: string }>>([]);
 
-  // Initialize Game Engine
+  // Initialize Game Engine with Full Level Pre-Baking
   const startLevel = useCallback((levelIdx: number, troopsToCarry?: Array<{ role: import('./types/game').Soldier['role']; name?: string }>) => {
     soundEngine.resume();
+    soundEngine.stopMenuMusic();
     const troops = troopsToCarry !== undefined ? troopsToCarry : carriedTroopsRef.current;
     const engine = new GameEngine(levelIdx, troops);
     carriedTroopsRef.current = []; // reset after carrying over
-    if (canvasRef.current && rendererRef.current) {
-      rendererRef.current.resize(canvasRef.current.clientWidth, canvasRef.current.clientHeight);
+    
+    // Canvas & Sprite Preloading
+    if (canvasRef.current) {
+      if (!rendererRef.current) {
+        rendererRef.current = new GameRenderer(canvasRef.current);
+      }
+      rendererRef.current.resize(canvasRef.current.clientWidth || 1200, canvasRef.current.clientHeight || 600);
+      rendererRef.current.preloadLevelAssets();
       engine.setViewport(rendererRef.current.getViewWidth(), 600);
     }
+    
     engineRef.current = engine;
     setCurrentLevelIndex(levelIdx);
+    setSelectedLevelIndex(levelIdx);
+    setStoredSelectedLevel(levelIdx);
+    setPendingLevelIndex(levelIdx);
+    setIsLoadingLevel(true);
     setInMainMenu(false);
     setShowMap(false);
+  }, []);
+
+  // Main Menu Music: Calm, flowing historic theme loaded once from audio folder
+  useEffect(() => {
+    if (inMainMenu) {
+      soundEngine.playMenuMusic();
+    } else {
+      soundEngine.stopMenuMusic();
+    }
+  }, [inMainMenu]);
+
+  const handleLevelLoaded = useCallback(() => {
+    setIsLoadingLevel(false);
+    if (canvasRef.current && rendererRef.current && engineRef.current) {
+      rendererRef.current.preloadLevelAssets();
+      engineRef.current.setViewport(rendererRef.current.getViewWidth(), 600);
+    }
     soundEngine.playMusic('day');
   }, []);
 
@@ -84,14 +119,13 @@ export default function App() {
     }
 
     let lastTime = performance.now();
-    let accumulator = 0;
-    const FIXED_DT = 1 / 60; // 60 Hz deterministic fixed update step
     let lastHudTick = 0;
 
     const loop = (currentTime: number) => {
-      const frameTime = Math.min((currentTime - lastTime) / 1000, 0.1);
+      // Delta time between VSync animation frames (capped to 50ms to prevent huge jumps on tab switch)
+      const frameTime = Math.min((currentTime - lastTime) / 1000, 0.05);
       lastTime = currentTime;
-      accumulator += frameTime;
+      const dt = Math.max(0.001, frameTime);
 
       try {
         const engine = engineRef.current;
@@ -115,16 +149,8 @@ export default function App() {
             touchSprinting.current) && moveDir !== 0
           );
 
-          // Fixed time-step simulation to prevent frame tearing, jitter and physics tunneling
-          let steps = 0;
-          while (accumulator >= FIXED_DT && steps < 5) {
-            engine.update(FIXED_DT, moveDir, isSprinting);
-            accumulator -= FIXED_DT;
-            steps++;
-          }
-          if (steps >= 5) {
-            accumulator = 0; // Prevent spiral of death on background tab focus
-          }
+          // VSync synchronized smooth frame update (eliminates judder, screen tearing and horse galloping stutter)
+          engine.update(dt, moveDir, isSprinting);
 
           // Render Canvas (VSync synchronized via requestAnimationFrame)
           renderer.render(
@@ -140,7 +166,7 @@ export default function App() {
             engine.groundCoins,
             engine.animals,
             engine.landingCamps,
-            frameTime
+            dt
           );
 
           // Record high score safely on game over / victory / day changes
@@ -148,8 +174,8 @@ export default function App() {
             recordLevelScore(currentLevelIndex, engine.state.enemiesDefeated, engine.state.dayNumber);
           }
 
-          // Trigger React HUD update (throttled to ~20 FPS so Canvas runs at pure 60-120 FPS)
-          if (currentTime - lastHudTick > 45) {
+          // Trigger React HUD update (throttled to ~12 FPS so Canvas runs at pure, unhindered 60-120 FPS)
+          if (currentTime - lastHudTick > 80) {
             lastHudTick = currentTime;
             setTick(currentTime);
           }
@@ -170,22 +196,41 @@ export default function App() {
     };
   }, [inMainMenu]);
 
-  // Window Resize Observer
+  // Window Resize & Responsive Layout Observer
   useEffect(() => {
     const handleResize = () => {
       if (canvasRef.current && rendererRef.current) {
         const parent = canvasRef.current.parentElement;
-        if (parent) {
-          const w = parent.clientWidth;
-          const h = parent.clientHeight;
+        const w = parent ? parent.clientWidth : window.innerWidth;
+        const h = parent ? parent.clientHeight : window.innerHeight;
+        if (w > 0 && h > 0) {
           rendererRef.current.resize(w, h);
+          if (engineRef.current) {
+            engineRef.current.setViewport(rendererRef.current.getViewWidth(), 600);
+          }
         }
       }
     };
 
     window.addEventListener('resize', handleResize);
+    window.addEventListener('orientationchange', handleResize);
+
+    // Modern ResizeObserver for flawless reactive resizing (handles macOS dock, Safari bars, iframe, fullscreen)
+    let resizeObserver: ResizeObserver | null = null;
+    if (canvasRef.current && canvasRef.current.parentElement && typeof ResizeObserver !== 'undefined') {
+      resizeObserver = new ResizeObserver(() => {
+        handleResize();
+      });
+      resizeObserver.observe(canvasRef.current.parentElement);
+    }
+
     handleResize();
-    return () => window.removeEventListener('resize', handleResize);
+
+    return () => {
+      window.removeEventListener('resize', handleResize);
+      window.removeEventListener('orientationchange', handleResize);
+      if (resizeObserver) resizeObserver.disconnect();
+    };
   }, []);
 
   // Keyboard Event Handlers & Sticky Keys Prevention
@@ -211,6 +256,9 @@ export default function App() {
 
       if (e.code === 'KeyE' || e.code === 'Space' || e.code === 'KeyS' || e.code === 'ArrowDown') {
         engine.isHoldingInteract = true;
+        if (engine.sendAssaultSquadToOtherCamp()) {
+          return;
+        }
         if (engine.activeSlotNearCommander) {
           engine.executeSlotAction(engine.activeSlotNearCommander);
         }
@@ -222,6 +270,10 @@ export default function App() {
 
       if (e.code === 'KeyF') {
         engine.callNavalFireSupport();
+      }
+
+      if (e.code === 'KeyT') {
+        engine.toggleRadioTelegraph();
       }
 
       if (e.code === 'KeyM') {
@@ -295,9 +347,11 @@ export default function App() {
     const nextIdx = currentLevelIndex + 1;
     if (nextIdx < CAMPAIGN_LEVELS.length) {
       if (nextIdx > unlockedLevel) {
-        setUnlockedLevel(nextIdx);
-        localStorage.setItem('canakkale_unlocked_level', nextIdx.toString());
+        setStoredUnlockedLevel(nextIdx);
+        setUnlockedLevelState(nextIdx);
       }
+      setStoredSelectedLevel(nextIdx);
+      setSelectedLevelIndex(nextIdx);
 
       // Calculate surviving veteran troops to carry over (Kingdom Two Crowns style)
       let carried: Array<{ role: import('./types/game').Soldier['role']; name?: string }> = [];
@@ -319,6 +373,18 @@ export default function App() {
       setInMainMenu(true);
       setShowMap(true);
     }
+  };
+
+  const handleSelectCampaignLevel = (level: number) => {
+    const valid = Math.max(0, Math.min(level, unlockedLevel));
+    setStoredSelectedLevel(valid);
+    setSelectedLevelIndex(valid);
+  };
+
+  const handleResetCampaign = () => {
+    resetCampaignProgress();
+    setUnlockedLevelState(0);
+    setSelectedLevelIndex(0);
   };
 
   const handleRestartLevel = () => {
@@ -373,9 +439,9 @@ export default function App() {
   const soldiersRecruited = engine ? engine.soldiers.length : 0;
 
   return (
-    <main className="relative w-screen h-screen bg-stone-950 overflow-hidden select-none font-sans">
+    <main className="fixed inset-0 w-full h-full bg-stone-950 overflow-hidden select-none font-sans">
       {/* 2D Pixel Canvas */}
-      <div className="absolute inset-0 w-full h-full flex items-center justify-center">
+      <div className="absolute inset-0 w-full h-full flex items-center justify-center overflow-hidden">
         <canvas
           ref={canvasRef}
           onPointerDown={handleCanvasPointerDown}
@@ -389,71 +455,223 @@ export default function App() {
 
       {/* Main Menu Screen */}
       {inMainMenu && (
-        <div className="absolute inset-0 z-40 flex flex-col items-center justify-between p-6 bg-stone-950/85 backdrop-blur-sm text-center">
-          <div />
+        <div
+          onClick={() => {
+            soundEngine.resume();
+            if (inMainMenu) soundEngine.playMenuMusic();
+          }}
+          className="absolute inset-0 z-40 flex flex-col items-center justify-between p-3 sm:p-6 bg-stone-950/90 backdrop-blur-md text-center overflow-y-auto select-none"
+        >
+          {/* Top Bar inside Menu */}
+          <div className="w-full max-w-2xl flex items-center justify-between text-xs font-cinzel text-stone-400 py-1">
+            <div className="flex items-center gap-2">
+              <span className="text-red-500 font-bold">🇹🇷</span>
+              <span className="font-semibold text-amber-200/90 tracking-wider text-[11px] sm:text-xs">
+                GELİBOLU 1915 • DESTANSI MÜDAFAA
+              </span>
+            </div>
 
-          <div className="flex flex-col items-center max-w-xl animate-fade-in">
+            <div className="flex items-center gap-2">
+              {/* Sound Toggle */}
+              <button
+                onClick={() => {
+                  const nextMute = !isMuted;
+                  setIsMuted(nextMute);
+                  soundEngine.setMuted(nextMute);
+                }}
+                className="p-2 sm:px-3 rounded-xl bg-stone-900/90 hover:bg-stone-800 text-amber-400 hover:text-amber-300 border border-stone-800 transition active:scale-95 cursor-pointer flex items-center gap-1.5 text-xs font-cinzel"
+                title={isMuted ? 'Sesi Aç' : 'Sesi Kapat'}
+              >
+                {isMuted ? <VolumeX className="w-4 h-4 text-red-400" /> : <Volume2 className="w-4 h-4 text-emerald-400" />}
+                <span className="hidden sm:inline text-[11px] text-stone-300">{isMuted ? 'Ses Kapalı' : 'Ses Açık'}</span>
+              </button>
+
+              {/* Reset Campaign */}
+              {unlockedLevel > 0 && (
+                <button
+                  onClick={handleResetCampaign}
+                  className="px-2.5 py-2 rounded-xl bg-stone-900/90 hover:bg-red-950/80 text-stone-400 hover:text-red-300 text-xs border border-stone-800 transition active:scale-95 cursor-pointer flex items-center gap-1"
+                  title="Sefer İlerlemesini Sıfırla (Bölüm 1'e Dön)"
+                >
+                  <RotateCcw className="w-3.5 h-3.5 text-red-400" />
+                  <span className="hidden sm:inline text-[11px]">Sıfırla</span>
+                </button>
+              )}
+            </div>
+          </div>
+
+          {/* Central War Council Panel */}
+          <div className="flex flex-col items-center max-w-2xl w-full my-auto py-2 sm:py-3 animate-fade-in">
             {/* Crest Emblem */}
-            <div className="w-20 h-20 rounded-3xl bg-amber-950/80 border-2 border-amber-500/80 flex items-center justify-center text-amber-400 shadow-2xl mb-4 relative">
-              <Shield className="w-11 h-11" />
-              <div className="absolute -top-1 -right-1 w-5 h-5 bg-red-600 rounded-full border border-stone-950 flex items-center justify-center text-[10px] font-bold text-stone-100">
+            <div className="w-16 h-16 sm:w-20 sm:h-20 rounded-3xl bg-gradient-to-br from-amber-900/90 via-stone-900 to-amber-950/90 border-2 border-amber-500/80 flex items-center justify-center text-amber-400 shadow-[0_0_35px_rgba(245,158,11,0.25)] mb-3 relative">
+              <Shield className="w-9 h-9 sm:w-11 sm:h-11" />
+              <div className="absolute -top-1.5 -right-1.5 px-1.5 py-0.5 bg-gradient-to-r from-red-600 to-red-700 rounded-full border border-stone-950 flex items-center justify-center text-[10px] font-black font-cinzel text-stone-100 shadow">
                 1915
               </div>
             </div>
 
-            <h1 className="text-3xl sm:text-5xl font-black font-cinzel text-amber-200 tracking-wider uppercase drop-shadow-md mb-2">
+            <h1 className="text-2xl sm:text-5xl font-black font-cinzel text-transparent bg-clip-text bg-gradient-to-r from-amber-200 via-amber-100 to-amber-300 tracking-wider uppercase drop-shadow-md mb-1">
               Çanakkale: Büyük Kumandan
             </h1>
-            <p className="text-sm sm:text-base font-pixel text-amber-400/90 mb-4 tracking-wide">
-              Siper Savunması & Destansı Muharebe
+            <p className="text-xs sm:text-sm font-pixel text-amber-400/90 mb-3 tracking-widest flex items-center gap-2 justify-center">
+              <span>⚔️</span>
+              <span>Siper Savunması & Kahramanlık Destanı</span>
+              <span>⚔️</span>
             </p>
 
-            <p className="text-xs sm:text-sm text-stone-300 font-sans leading-relaxed mb-6 bg-stone-900/90 border border-stone-800 p-4 rounded-2xl shadow-inner text-left">
-              2D piksel art. Gelibolu yarımadasında komutanınla gündüzleri odun kes, siperler kaz, makineli tüfek yuvaları kur ve Mehmetçik sevk et. Gece bastırdığında ise düşman akınlarına karşı vatanı cansiperane müdafaa et!
+            <p className="text-xs sm:text-[13px] text-stone-300 font-sans leading-relaxed mb-4 bg-stone-900/80 border border-stone-800/80 p-3 sm:p-3.5 rounded-2xl shadow-inner text-center max-w-xl">
+              Gelibolu yarımadasında komutanınla gündüzleri odun kes, siperler kaz, makineli tüfek yuvaları kur ve Mehmetçik sevk et. Gece bastırdığında ise düşman akınlarına karşı vatanı cansiperane müdafaa et!
             </p>
 
-            <div className="flex flex-col sm:flex-row items-center gap-3 w-full justify-center">
+            {/* Currently Active / Selected Chapter Banner with Integrated Chapter Switcher */}
+            {(() => {
+              const activeChapter = CAMPAIGN_LEVELS[selectedLevelIndex] || CAMPAIGN_LEVELS[0];
+              const isCompleted = selectedLevelIndex < unlockedLevel;
+              const hasPrev = selectedLevelIndex > 0;
+              const hasNext = selectedLevelIndex < unlockedLevel && selectedLevelIndex < CAMPAIGN_LEVELS.length - 1;
+
+              return (
+                <div className="w-full bg-gradient-to-r from-[#2a170d]/95 via-[#3d2011]/95 to-[#2a170d]/95 border-2 border-amber-600/70 rounded-2xl p-3.5 sm:p-4 mb-4 shadow-2xl flex flex-col gap-2.5 sm:gap-3 text-left">
+                  {/* Top Bar of Chapter Card */}
+                  <div className="flex items-center justify-between gap-2 border-b border-amber-800/50 pb-2 flex-wrap">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className="text-[10px] font-pixel text-amber-300 bg-black/60 px-2 py-0.5 rounded border border-amber-500/50">
+                        BÖLÜM {selectedLevelIndex + 1} / {CAMPAIGN_LEVELS.length}
+                      </span>
+                      <span className="text-[10px] font-pixel text-amber-200/80">
+                        {activeChapter.historicalDateTr}
+                      </span>
+                      {isCompleted && (
+                        <span className="text-[10px] font-cinzel font-bold text-emerald-300 bg-emerald-950/80 px-2 py-0.5 rounded border border-emerald-600/50">
+                          ✓ Zafer Kazanıldı
+                        </span>
+                      )}
+                    </div>
+
+                    <span className="text-[10px] font-pixel text-amber-400/80 shrink-0">
+                      ({unlockedLevel + 1}/{CAMPAIGN_LEVELS.length} Cephe Açık)
+                    </span>
+                  </div>
+
+                  {/* Chapter Main Details & Navigation Arrows */}
+                  <div className="flex items-center justify-between gap-2 sm:gap-3">
+                    <button
+                      onClick={() => {
+                        if (hasPrev) {
+                          const prev = selectedLevelIndex - 1;
+                          setSelectedLevelIndex(prev);
+                          setStoredSelectedLevel(prev);
+                          soundEngine.playCoin();
+                        }
+                      }}
+                      disabled={!hasPrev}
+                      className={`p-2 sm:px-3 sm:py-2.5 rounded-xl border flex items-center gap-1 font-cinzel font-bold text-xs transition cursor-pointer shrink-0 ${
+                        hasPrev
+                          ? 'bg-amber-950/80 hover:bg-amber-900 border-amber-600/80 text-amber-200 active:scale-95'
+                          : 'bg-stone-900/50 border-stone-800 text-stone-600 cursor-not-allowed'
+                      }`}
+                      title={hasPrev ? 'Önceki Cepheye Geç' : 'İlk Cephedesiniz'}
+                    >
+                      <ChevronLeft className="w-4 h-4" />
+                      <span className="hidden sm:inline">Önceki</span>
+                    </button>
+
+                    <div className="flex-1 text-center sm:text-left px-1">
+                      <h3 className="text-sm sm:text-base font-bold font-cinzel text-amber-100">
+                        {activeChapter.nameTr}
+                      </h3>
+                      <p className="text-[11px] text-amber-300/90 font-serif mt-0.5">
+                        📍 {activeChapter.locationTr} • <span className="text-amber-400 font-semibold">Hedef: {activeChapter.daysToWin} Gün Savunma</span>
+                      </p>
+                    </div>
+
+                    <button
+                      onClick={() => {
+                        if (hasNext) {
+                          const next = selectedLevelIndex + 1;
+                          setSelectedLevelIndex(next);
+                          setStoredSelectedLevel(next);
+                          soundEngine.playCoin();
+                        }
+                      }}
+                      disabled={!hasNext}
+                      className={`p-2 sm:px-3 sm:py-2.5 rounded-xl border flex items-center gap-1 font-cinzel font-bold text-xs transition cursor-pointer shrink-0 ${
+                        hasNext
+                          ? 'bg-amber-950/80 hover:bg-amber-900 border-amber-600/80 text-amber-200 active:scale-95'
+                          : 'bg-stone-900/50 border-stone-800 text-stone-600 cursor-not-allowed'
+                      }`}
+                      title={hasNext ? 'Sonraki Cepheye Geç' : 'Henüz Açılmadı'}
+                    >
+                      <span className="hidden sm:inline">Sonraki</span>
+                      <ChevronRight className="w-4 h-4" />
+                    </button>
+                  </div>
+                </div>
+              );
+            })()}
+
+            {/* Action Buttons Section */}
+            <div className="w-full flex flex-col gap-2.5 sm:gap-3">
+              {/* Primary Call to Action: Start Battle */}
               <button
-                onClick={() => startLevel(unlockedLevel)}
-                className="w-full sm:w-auto py-3.5 px-8 rounded-2xl bg-gradient-to-r from-amber-600 to-amber-700 hover:from-amber-500 hover:to-amber-600 text-stone-950 font-cinzel font-black text-base shadow-xl flex items-center justify-center gap-2 border border-amber-400 transition active:scale-95"
+                onClick={() => startLevel(selectedLevelIndex)}
+                className="w-full py-3.5 sm:py-4 px-6 rounded-2xl bg-gradient-to-r from-amber-600 via-amber-500 to-amber-700 hover:from-amber-500 hover:to-amber-600 text-stone-950 font-cinzel font-black text-base sm:text-lg shadow-[0_0_25px_rgba(245,158,11,0.3)] flex items-center justify-center gap-2.5 border-2 border-amber-300 transition-all active:scale-[0.98] cursor-pointer"
               >
                 <Play className="w-5 h-5 fill-stone-950" />
-                <span>Muharebeye Başla</span>
+                <span>MUHAREBEYE BAŞLA (BÖLÜM {selectedLevelIndex + 1})</span>
               </button>
 
-              <button
-                onClick={() => setShowHelp(true)}
-                className="w-full sm:w-auto py-3.5 px-6 rounded-2xl bg-gradient-to-r from-amber-950/80 to-stone-900 hover:from-amber-900 hover:to-stone-800 text-amber-300 font-cinzel font-bold text-sm border border-amber-500/60 shadow-xl flex items-center justify-center gap-2 transition active:scale-95"
-              >
-                <HelpCircle className="w-4 h-4 text-amber-400" />
-                <span>Nasıl Oynanır?</span>
-              </button>
+              {/* Secondary Actions: 3-column equal-size balanced grid */}
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 sm:gap-2.5 w-full">
+                <button
+                  onClick={() => setShowMap(true)}
+                  className="py-2.5 sm:py-3 px-3 rounded-xl bg-gradient-to-r from-stone-900 to-stone-800 hover:from-amber-950/80 hover:to-stone-800 text-amber-300 font-cinzel font-bold text-xs sm:text-sm border border-amber-600/50 hover:border-amber-400 shadow-lg flex items-center justify-center gap-2 transition active:scale-95 cursor-pointer"
+                >
+                  <Map className="w-4 h-4 text-amber-400 shrink-0" />
+                  <span>Bölüm Haritası</span>
+                </button>
 
-              <button
-                onClick={() => setShowMap(true)}
-                className="w-full sm:w-auto py-3.5 px-6 rounded-2xl bg-stone-900 hover:bg-stone-800 text-stone-200 font-cinzel font-bold text-sm border border-stone-700 shadow-xl flex items-center justify-center gap-2 transition"
-              >
-                <Map className="w-4 h-4 text-sky-400" />
-                <span>Cephe Haritası</span>
-              </button>
+                <button
+                  onClick={() => setShowHelp(true)}
+                  className="py-2.5 sm:py-3 px-3 rounded-xl bg-stone-900 hover:bg-stone-800 text-stone-200 hover:text-amber-200 font-cinzel font-bold text-xs sm:text-sm border border-stone-700/80 hover:border-amber-500/50 shadow-lg flex items-center justify-center gap-2 transition active:scale-95 cursor-pointer"
+                >
+                  <HelpCircle className="w-4 h-4 text-amber-400 shrink-0" />
+                  <span>Nasıl Oynanır?</span>
+                </button>
 
-              <button
-                onClick={() => setShowCodex(true)}
-                className="w-full sm:w-auto py-3.5 px-6 rounded-2xl bg-stone-900 hover:bg-stone-800 text-stone-200 font-cinzel font-bold text-sm border border-stone-700 shadow-xl flex items-center justify-center gap-2 transition"
-              >
-                <BookOpen className="w-4 h-4 text-amber-400" />
-                <span>Tarihi Ansiklopedi</span>
-              </button>
+                <button
+                  onClick={() => setShowCodex(true)}
+                  className="py-2.5 sm:py-3 px-3 rounded-xl bg-stone-900 hover:bg-stone-800 text-stone-200 hover:text-amber-200 font-cinzel font-bold text-xs sm:text-sm border border-stone-700/80 hover:border-amber-500/50 shadow-lg flex items-center justify-center gap-2 transition active:scale-95 cursor-pointer"
+                >
+                  <BookOpen className="w-4 h-4 text-amber-400 shrink-0" />
+                  <span>Ansiklopedi</span>
+                </button>
+              </div>
             </div>
           </div>
 
           {/* Controls hint at bottom */}
-          <div className="text-[11px] text-stone-400 font-cinzel flex flex-wrap items-center justify-center gap-4 bg-stone-900/60 px-4 py-2 rounded-xl border border-stone-800">
-            <span>[A / D / Ok Tuşları]: Komutan Hareketi</span>
-            <span>[Shift]: Dörtnala Koş</span>
-            <span>[E / Boşluk]: Siper Kaz / İnşa Et</span>
-            <span>[Q]: Hücum Düdüğü</span>
-            <span>[F]: Sahil Bataryası</span>
+          <div className="text-[11px] text-stone-400 font-cinzel flex flex-wrap items-center justify-center gap-2.5 sm:gap-4 bg-stone-900/70 px-3 sm:px-4 py-2 rounded-xl border border-stone-800 max-w-2xl w-full">
+            <span className="flex items-center gap-1">
+              <kbd className="px-1 py-0.5 rounded bg-stone-800 text-[10px] text-amber-300 border border-stone-700">A / D</kbd>
+              <span>Komutan</span>
+            </span>
+            <span className="flex items-center gap-1">
+              <kbd className="px-1 py-0.5 rounded bg-stone-800 text-[10px] text-amber-300 border border-stone-700">Shift</kbd>
+              <span>Dörtnala</span>
+            </span>
+            <span className="flex items-center gap-1">
+              <kbd className="px-1 py-0.5 rounded bg-stone-800 text-[10px] text-amber-300 border border-stone-700">E / Boşluk</kbd>
+              <span>Siper & İnşa</span>
+            </span>
+            <span className="flex items-center gap-1">
+              <kbd className="px-1 py-0.5 rounded bg-stone-800 text-[10px] text-amber-300 border border-stone-700">Q</kbd>
+              <span>Taarruz Düdüğü</span>
+            </span>
+            <span className="flex items-center gap-1">
+              <kbd className="px-1 py-0.5 rounded bg-stone-800 text-[10px] text-amber-300 border border-stone-700">F</kbd>
+              <span>Sahil Topu</span>
+            </span>
           </div>
         </div>
       )}
@@ -483,6 +701,7 @@ export default function App() {
             onWhistle={() => engine.useCommanderWhistle()}
             onNavalSupport={() => engine.callNavalFireSupport()}
             onOpenMainMenu={handleReturnToHQ}
+            onToggleRadio={() => engine.toggleRadioTelegraph()}
           />
 
           {/* Tactical Left Column: Daily Front Orders (Collapsible, Auto-hides when 3/3 complete) + Whistle Notification / Countdown */}
@@ -596,35 +815,6 @@ export default function App() {
             )}
           </div>
 
-          {/* Universal Tactical Command Dock */}
-          <CommanderControls
-            commander={engine.commander}
-            timePhase={engine.state.timePhase}
-            activeSlot={engine.activeSlotNearCommander}
-            onMoveLeftStart={() => {
-              touchMoveDir.current = -1;
-            }}
-            onMoveLeftEnd={() => {
-              if (touchMoveDir.current === -1) touchMoveDir.current = 0;
-            }}
-            onMoveRightStart={() => {
-              touchMoveDir.current = 1;
-            }}
-            onMoveRightEnd={() => {
-              if (touchMoveDir.current === 1) touchMoveDir.current = 0;
-            }}
-            onSprintToggle={() => {
-              touchSprinting.current = !touchSprinting.current;
-            }}
-            isSprinting={touchSprinting.current}
-            onInteract={() => {
-              if (engine.activeSlotNearCommander) {
-                engine.executeSlotAction(engine.activeSlotNearCommander);
-              }
-            }}
-            onWhistle={() => engine.useCommanderWhistle()}
-          />
-
           {/* Victory Modal */}
           {engine.state.isVictory && (
             <VictoryModal
@@ -647,12 +837,25 @@ export default function App() {
         </>
       )}
 
+      {/* Level Pre-loading Screen with Historical Briefing */}
+      {isLoadingLevel && (
+        <LevelLoadingScreen
+          levelIndex={pendingLevelIndex}
+          onLoaded={handleLevelLoaded}
+        />
+      )}
+
       {/* Map, Codex & How-to-Play Modals */}
       {showMap && (
         <CampaignMap
           unlockedLevel={unlockedLevel}
-          currentLevelIndex={currentLevelIndex}
+          currentLevelIndex={selectedLevelIndex}
           onSelectLevel={(idx) => startLevel(idx)}
+          onConfirmSelectionAndClose={(idx) => {
+            handleSelectCampaignLevel(idx);
+            setShowMap(false);
+          }}
+          onResetCampaign={handleResetCampaign}
           onClose={() => setShowMap(false)}
           onOpenMainMenu={handleReturnToHQ}
         />
@@ -664,7 +867,17 @@ export default function App() {
         <HowToPlayModal
           isOpen={showHelp}
           onClose={() => setShowHelp(false)}
-          onStartGame={inMainMenu ? () => startLevel(unlockedLevel) : undefined}
+          onStartGame={inMainMenu ? () => startLevel(selectedLevelIndex) : undefined}
+        />
+      )}
+
+      {/* Field Wireless Telegraph & Cipher Decoder Modal */}
+      {engine && engine.state.radioIntercept?.isOpenUI && (
+        <RadioTelegraphModal
+          radioState={engine.state.radioIntercept}
+          onClose={() => engine.toggleRadioTelegraph(false)}
+          onTuneFrequency={(freq) => engine.tuneRadioFrequency(freq)}
+          onDecodeSuccess={() => engine.decodeRadioSignal()}
         />
       )}
     </main>

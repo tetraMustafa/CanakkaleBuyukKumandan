@@ -19,7 +19,7 @@ interface CommanderControlsProps {
   onNavigateToType?: (type: SlotType) => void;
 }
 
-export const CommanderControls: React.FC<CommanderControlsProps> = ({
+export const CommanderControls: React.FC<CommanderControlsProps> = React.memo(({
   commander,
   timePhase: _timePhase,
   activeSlot,
@@ -35,9 +35,9 @@ export const CommanderControls: React.FC<CommanderControlsProps> = ({
   const canWhistle = commander.whistleCooldown <= 0;
 
   return (
-    <div className="absolute inset-x-0 bottom-2 px-3 sm:px-6 flex flex-col items-center gap-2 pointer-events-none z-20 select-none">
+    <div className="absolute inset-x-0 bottom-2 px-3 sm:px-6 flex flex-col items-center gap-2 pointer-events-none z-20 select-none pb-[env(safe-area-inset-bottom,0px)] [contain:layout_style]">
       {/* Main Bottom Control Center: Left movement & Right actions */}
-      <div className="w-full flex items-center justify-between pointer-events-none">
+      <div className="w-full flex items-center justify-between pointer-events-none [contain:layout_style]">
         {/* Left Movement Controls */}
         <div className="flex items-center gap-2 pointer-events-auto">
           <button
@@ -47,7 +47,7 @@ export const CommanderControls: React.FC<CommanderControlsProps> = ({
             onTouchStart={onMoveLeftStart}
             onTouchEnd={onMoveLeftEnd}
             onTouchCancel={onMoveLeftEnd}
-            className="w-12 h-12 sm:w-14 sm:h-14 bg-stone-900/90 active:bg-amber-600/90 hover:border-amber-400 border-2 border-stone-700 rounded-2xl flex flex-col items-center justify-center text-amber-200 shadow-xl backdrop-blur-md transition active:scale-95"
+            className="w-12 h-12 sm:w-14 sm:h-14 bg-stone-900 active:bg-amber-600 hover:border-amber-400 border-2 border-stone-700 rounded-2xl flex flex-col items-center justify-center text-amber-200 shadow-lg active:scale-95"
             title="Sola Sür [A / Sol Ok]"
           >
             <ArrowLeft className="w-5 h-5 sm:w-6 sm:h-6" />
@@ -61,7 +61,7 @@ export const CommanderControls: React.FC<CommanderControlsProps> = ({
             onTouchStart={onMoveRightStart}
             onTouchEnd={onMoveRightEnd}
             onTouchCancel={onMoveRightEnd}
-            className="w-12 h-12 sm:w-14 sm:h-14 bg-stone-900/90 active:bg-amber-600/90 hover:border-amber-400 border-2 border-stone-700 rounded-2xl flex flex-col items-center justify-center text-amber-200 shadow-xl backdrop-blur-md transition active:scale-95"
+            className="w-12 h-12 sm:w-14 sm:h-14 bg-stone-900 active:bg-amber-600 hover:border-amber-400 border-2 border-stone-700 rounded-2xl flex flex-col items-center justify-center text-amber-200 shadow-lg active:scale-95"
             title="Sağa Sür [D / Sağ Ok]"
           >
             <ArrowRight className="w-5 h-5 sm:w-6 sm:h-6" />
@@ -71,10 +71,10 @@ export const CommanderControls: React.FC<CommanderControlsProps> = ({
           {/* Gallop Toggle */}
           <button
             onClick={onSprintToggle}
-            className={`w-10 h-10 sm:w-12 sm:h-12 rounded-2xl border-2 flex flex-col items-center justify-center shadow-xl backdrop-blur-md transition active:scale-95 ${
+            className={`w-10 h-10 sm:w-12 sm:h-12 rounded-2xl border-2 flex flex-col items-center justify-center shadow-lg active:scale-95 ${
               isSprinting
                 ? 'bg-amber-600 border-amber-300 text-stone-950'
-                : 'bg-stone-900/90 border-stone-700 text-amber-400 hover:border-amber-500'
+                : 'bg-stone-900 border-stone-700 text-amber-400 hover:border-amber-500'
             }`}
             title="Dörtnala Koş [Shift]"
           >
@@ -89,10 +89,10 @@ export const CommanderControls: React.FC<CommanderControlsProps> = ({
           {activeSlot && onInteract && (
             <button
               onClick={onInteract}
-              className={`px-3 py-1.5 min-h-[42px] sm:min-h-[46px] border rounded-xl flex items-center gap-2 shadow-xl backdrop-blur-md transition active:scale-95 ${
+              className={`px-3 py-1.5 min-h-[42px] sm:min-h-[46px] border rounded-xl flex items-center gap-2 shadow-lg active:scale-95 ${
                 activeSlot.underConstruction
-                  ? 'bg-rose-950/90 hover:bg-rose-900/90 text-rose-100 border-rose-500/80 shadow-[0_0_15px_rgba(225,29,72,0.3)]'
-                  : 'bg-stone-950/90 hover:bg-stone-900 border-amber-500/80 hover:border-amber-400 text-amber-200 shadow-[0_0_15px_rgba(245,158,11,0.2)]'
+                  ? 'bg-rose-950 hover:bg-rose-900 text-rose-100 border-rose-500'
+                  : 'bg-stone-950 hover:bg-stone-900 border-amber-500 hover:border-amber-400 text-amber-200'
               }`}
               title={activeSlot.underConstruction ? 'İnşaatı Durdur / İptal Et [E]' : `${activeSlot.titleTr} [E / Boşluk]`}
             >
@@ -161,10 +161,10 @@ export const CommanderControls: React.FC<CommanderControlsProps> = ({
           {/* Whistle Button [Q] (3 Sikke) */}
           <button
             onClick={onWhistle}
-            className={`min-h-[42px] sm:min-h-[46px] px-3 rounded-xl border flex items-center gap-2 shadow-xl backdrop-blur-md transition active:scale-95 ${
+            className={`min-h-[42px] sm:min-h-[46px] px-3 rounded-xl border flex items-center gap-2 shadow-lg transition active:scale-95 ${
               canWhistle && commander.mecidiye >= 3
-                ? 'bg-amber-950/90 active:bg-amber-800 border-amber-500/80 text-amber-200 hover:border-amber-400 shadow-[0_0_15px_rgba(245,158,11,0.2)]'
-                : 'bg-stone-950/80 border-stone-800 text-stone-500'
+                ? 'bg-amber-950 active:bg-amber-800 border-amber-500/80 text-amber-200 hover:border-amber-400'
+                : 'bg-stone-950 border-stone-800 text-stone-500'
             }`}
             title="Taarruz Düdüğü [Q] (3 Sikke) - Neferleri coşturur (+%50 ateş hızı) ve mevzileri destekler."
           >
@@ -183,5 +183,5 @@ export const CommanderControls: React.FC<CommanderControlsProps> = ({
       </div>
     </div>
   );
-};
+});
 

@@ -27,17 +27,68 @@ export class GameRenderer {
   private ctx: CanvasRenderingContext2D;
   private lightCanvas: HTMLCanvasElement;
   private lightCtx: CanvasRenderingContext2D;
+  private staticSpriteCache: Map<string, HTMLCanvasElement> = new Map();
   private width: number = 1200;
   private height: number = 600;
   private groundY: number = 440;
   private animTimer: number = 0;
+
+  // --- Frame Budget Manager (Guarantees Smooth 60 FPS under heavy combat) ---
+  private frameStartTime: number = 0;
+  private readonly FRAME_BUDGET_MS: number = 14.0; // 14ms compute limit leaving 2.6ms margin for browser compositing
+  private lastFrameDurationMs: number = 0;
+  private isThrottledFrame: boolean = false;
+
+  // --- Persistent Offscreen Buffers for Static Map Elements ---
+  private terrainBufferCanvas: HTMLCanvasElement;
+  private terrainBufferCtx: CanvasRenderingContext2D;
+  private terrainBufferKey: string = '';
+
+  private hillsBufferCanvas: HTMLCanvasElement;
+  private hillsBufferCtx: CanvasRenderingContext2D;
+  private hillsBufferKey: string = '';
+
+  private forestBufferCanvas: HTMLCanvasElement;
+  private forestBufferCtx: CanvasRenderingContext2D;
+  private forestBufferKey: string = '';
+  private forestBufferDirty: boolean = true;
+  private cachedVisibleTrees: BuildSlot[] = [];
+  private winterProgress: number = 0; // 0.0 (Bahar/Yaz/Güz) -> 1.0 (Tam Kış & Kar Örtüsü)
+  private snowFootprints: Array<{
+    x: number;
+    y: number;
+    facing: number;
+    type: 'hoof' | 'boot';
+    alpha: number;
+    depth: number;
+    age: number;
+    side: -1 | 1;
+  }> = [];
+  private lastCmdFootprintX: number = 0;
+  private cmdFootprintSide: -1 | 1 = 1;
 
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
     this.ctx = canvas.getContext('2d', { alpha: false })!;
     this.lightCanvas = document.createElement('canvas');
     this.lightCtx = this.lightCanvas.getContext('2d')!;
+
+    // Initialize Offscreen Buffers
+    this.terrainBufferCanvas = document.createElement('canvas');
+    this.terrainBufferCtx = this.terrainBufferCanvas.getContext('2d')!;
+
+    this.hillsBufferCanvas = document.createElement('canvas');
+    this.hillsBufferCtx = this.hillsBufferCanvas.getContext('2d')!;
+
+    this.forestBufferCanvas = document.createElement('canvas');
+    this.forestBufferCtx = this.forestBufferCanvas.getContext('2d')!;
+
+    this.preRenderStaticSprites();
     this.resize(canvas.clientWidth || 1200, canvas.clientHeight || 600);
+  }
+
+  public isOverBudget(): boolean {
+    return (performance.now() - this.frameStartTime) > this.FRAME_BUDGET_MS;
   }
 
   public getViewWidth(): number {
@@ -54,8 +105,10 @@ export class GameRenderer {
     const aspect = cWidth / cHeight;
 
     this.height = GameRenderer.VIRTUAL_HEIGHT; // Always locked to 600
+    // Adaptable virtual width: Matches true aspect ratio (16:10 macOS 1280x800, 16:9, 4:3, up to 21:9 ultrawide)
+    // Prevents distortion and guarantees 1:1 pixel square proportion on all screens
     this.width = Math.round(GameRenderer.VIRTUAL_HEIGHT * aspect);
-    this.width = Math.max(960, Math.min(1800, this.width));
+    this.width = Math.max(800, Math.min(2400, this.width));
 
     this.canvas.width = this.width;
     this.canvas.height = this.height;
@@ -79,10 +132,26 @@ export class GameRenderer {
     landingCamps: LandingCamp[] = [],
     frameDt: number = 0.016
   ) {
+    this.frameStartTime = performance.now();
     this.animTimer += Math.min(0.06, frameDt * 3.0);
+
+    // Kış Mevsimine Geçişte Kademeli Kar Yağdıkça Birikme (Smooth Snow Accumulation / Thawing Tweening)
+    const dt = Math.max(0.001, Math.min(0.1, frameDt));
+    if (state.season === 'winter') {
+      // Kar yağarken veya fırtınada kademeli kar birikimi; açık kışta daha yavaş
+      const snowAccumRate = (state.weather === 'snow' || state.weather === 'storm') ? 0.055 : 0.022;
+      this.winterProgress = Math.min(1.0, this.winterProgress + dt * snowAccumRate);
+    } else {
+      // Kış dışındaki mevsimlerde karların erimesi
+      this.winterProgress = Math.max(0.0, this.winterProgress - dt * 0.18);
+    }
+
+    // Kar üzerinde ayak ve nal izleri simülasyonu
+    this.updateFootprints(dt, state, commander, soldiers);
+
     const ctx = this.ctx;
-    // Round camera coordinate to exact whole integer to eliminate sub-pixel antialiasing jitter & tearing during movement
-    const camX = Math.round(state.cameraX);
+    // Continuous camera tracking coordinate for ultra-smooth 60/120 FPS subpixel rendering
+    const camX = state.cameraX;
 
     // 1. Draw Sky & Parallax Backgrounds
     this.drawSkyAndParallax(state, camX);
@@ -92,6 +161,9 @@ export class GameRenderer {
 
     // 3. Draw Terrain & Ground (Dirt layers, geological strata, beach & foaming sea water)
     this.drawTerrain(state, camX, slots);
+
+    // 3.5 Character & Mount Snow Footprints (Kar Üzerinde Ayak & Nal İzleri)
+    this.drawFootprints(camX, state);
 
     // 4. Dynamic Forest Backdrop (Kingdom Two Crowns style - wilderness canopy & background timber)
     this.drawForestBackdrop(slots, camX, state);
@@ -110,6 +182,9 @@ export class GameRenderer {
     // 6.5 Foreground Grass & Wild Poppies (Extra depth over trenches & ground edge)
     this.drawForegroundGrass(state, camX, slots);
 
+    // 6.6 Atmospheric Rolling Fog & Sea Mist Layer (Hafif Sis)
+    this.drawAtmosphericFog(camX, state);
+
     // 7. Draw Coastal Landing Barges / Inland Fortified Bunker
     if (landingCamps && landingCamps.length > 0) {
       this.drawLandingCamps(landingCamps, camX, state);
@@ -122,7 +197,7 @@ export class GameRenderer {
     this.drawGroundCoins(groundCoins, camX);
 
     // 10. Draw Soldiers (Mehmetçik)
-    this.drawSoldiers(soldiers, camX, slots);
+    this.drawSoldiers(soldiers, camX, slots, commander, landingCamps);
 
     // 10.25 Draw Field Artillery (75mm Krupp Sahra Topu)
     this.drawFieldArtilleries(state.fieldArtilleries || [], camX);
@@ -144,17 +219,26 @@ export class GameRenderer {
     // 13. Draw Projectiles (Bullets, Artillery, Grenades, Flares)
     this.drawProjectiles(projectiles, camX, state);
 
-    // 14. Draw Particles (Sparks, Smoke, Blood, Debris, Weather)
+    // 14. Draw Particles (Sparks, Smoke, Blood, Debris)
     this.drawParticles(particles, camX);
 
     // 15. Draw Water Reflection (Kingdom Two Crowns style lower river/sea reflection)
     this.drawWaterReflection(camX, state);
+
+    // 15.5 Atmospheric Rain Streaks & Water Surface Droplet Impacts (Yağmur Damlaları & Suya Çarpma Efekti)
+    this.drawAtmosphericRain(camX, state);
+
+    // 15.6 Atmospheric Drifting Snowflakes (Kış Mevsimi Kar Yağışı)
+    this.drawAtmosphericSnow(camX, state);
 
     // 16. Dynamic Lighting Layer (Night darkness, lantern, campfires, flares, searchlights)
     this.drawLighting(state, commander, slots, projectiles, particles, camX, landingCamps);
 
     // 17. Floating Numbers and Prompt Highlights
     this.drawFloatingTexts(floatingTexts, camX);
+
+    this.lastFrameDurationMs = performance.now() - this.frameStartTime;
+    this.isThrottledFrame = this.lastFrameDurationMs > this.FRAME_BUDGET_MS;
   }
 
   // --- Parallax & Environment Rendering Helpers ---
@@ -241,9 +325,28 @@ export class GameRenderer {
     let curMid = this.lerpColor(k1.mid, k2.mid, segT);
     let curBot = this.lerpColor(k1.bot, k2.bot, segT);
 
+    // Seasonal Sky Color Tinting
+    if (state.season === 'summer') {
+      // Kızgın Akdeniz güneşi, kavrulmuş açık sıcak yaz göğü
+      curTop = this.lerpColor(curTop, '#0284c7', 0.20);
+      curMid = this.lerpColor(curMid, '#7dd3fc', 0.32);
+      curBot = this.lerpColor(curBot, '#fef08a', 0.25);
+    } else if (state.season === 'autumn') {
+      curTop = this.lerpColor(curTop, '#1e1b4b', 0.20);
+      curMid = this.lerpColor(curMid, '#9a3412', 0.25);
+      curBot = this.lerpColor(curBot, '#d97706', 0.30);
+    } else if (this.winterProgress > 0.05) {
+      // Kış mevsiminde karla kaplı soğuk, kurşuni ve puslu kış göğü
+      const wProg = this.winterProgress;
+      curTop = this.lerpColor(curTop, '#334155', wProg * 0.60);
+      curMid = this.lerpColor(curMid, '#475569', wProg * 0.62);
+      curBot = this.lerpColor(curBot, '#94a3b8', wProg * 0.68);
+    }
+
     // Weather Storm Overcast modification (safe string interpolation)
-    if (state.weather === 'rain' || state.weather === 'storm') {
-      curTop = this.lerpColor(curTop, '#1e293b', 0.65);
+    if (state.weather === 'rain' || state.weather === 'storm' || (state.weather === 'snow' && state.season === 'winter')) {
+      const stormTint = state.weather === 'snow' ? '#475569' : '#1e293b';
+      curTop = this.lerpColor(curTop, stormTint, 0.65);
       curMid = this.lerpColor(curMid, '#334155', 0.65);
       curBot = this.lerpColor(curBot, '#64748b', 0.65);
     }
@@ -294,8 +397,6 @@ export class GameRenderer {
 
         // Glowing Sun Core Disc
         ctx.fillStyle = isHorizonSun ? '#fed7aa' : '#ffffff';
-        ctx.shadowColor = isHorizonSun ? '#ea580c' : '#fef08a';
-        ctx.shadowBlur = 18;
         ctx.beginPath();
         ctx.arc(sunX, sunY, sunRadius, 0, Math.PI * 2);
         ctx.fill();
@@ -407,8 +508,6 @@ export class GameRenderer {
 
         // Crescent Ottoman Hilal - Rendered with clean arc subtraction so background is never overwritten
         ctx.fillStyle = '#fef9c3';
-        ctx.shadowColor = '#bae6fd';
-        ctx.shadowBlur = 12;
         ctx.beginPath();
         ctx.arc(moonX, moonY, 15, -0.68 * Math.PI, 0.68 * Math.PI, false);
         ctx.arc(moonX + 5.5, moonY - 1.5, 13, 0.68 * Math.PI, -0.68 * Math.PI, true);
@@ -417,7 +516,6 @@ export class GameRenderer {
 
         // Ottoman Star nestled inside crescent
         ctx.fillStyle = '#ffffff';
-        ctx.shadowBlur = 6;
         ctx.beginPath();
         ctx.arc(moonX + 6, moonY - 1.5, 2.5, 0, Math.PI * 2);
         ctx.fill();
@@ -468,129 +566,327 @@ export class GameRenderer {
     const isSunset = p >= 0.62 && p <= 0.70;
     const lvlId = state.level.id;
 
-    // --- 1. Layer 0: Distant Anatolian Mountain Ridges & Peaks (Parallax 0.03) ---
-    const p0 = camX * 0.03;
+    // --- 1. Layer 0A: Soaring Distant Anatolian Mountain Ranges (Kaz Dağları / Mt. Ida - Parallax 0.025) ---
+    const p0 = camX * 0.025;
     
-    // Rich, atmospheric color schemes per chapter - vibrant, deep, zero dull grey
-    let mtnGrad = ctx.createLinearGradient(0, gY - 260, 0, gY);
+    // Atmospheric aerial perspective mountain gradients (soft, desaturated natural tones adapted to seasons)
+    let mtnGrad = ctx.createLinearGradient(0, gY - 240, 0, gY);
+    const isSummer = state.season === 'summer';
+    const isWinterSeason = state.season === 'winter';
+    const isAutumnSeason = state.season === 'autumn';
+
     if (lvlId === 1) {
-      // Seddülbahir & Aegean Coast: Deep Aegean maritime purples and rich deep cobalt
+      // Seddülbahir & Aegean Coast: Maritime hazy slate-blue peaks blending into horizon mist
       if (isNight) {
-        mtnGrad.addColorStop(0, '#0f172a');
-        mtnGrad.addColorStop(1, '#050814');
+        mtnGrad.addColorStop(0, '#0c1322');
+        mtnGrad.addColorStop(0.5, '#080e1a');
+        mtnGrad.addColorStop(1, '#050812');
       } else if (isSunset) {
-        mtnGrad.addColorStop(0, '#701a75');
-        mtnGrad.addColorStop(0.6, '#9a3412');
-        mtnGrad.addColorStop(1, '#431407');
+        mtnGrad.addColorStop(0, '#581c3f');
+        mtnGrad.addColorStop(0.5, '#701a40');
+        mtnGrad.addColorStop(1, '#831843');
+      } else if (isSummer) {
+        // Yaz: Zengin Akdeniz çam ormanları & berrak güneş (yapraklar solmaz, sonbaharda solar)
+        mtnGrad.addColorStop(0, '#133520');
+        mtnGrad.addColorStop(0.45, '#1e522f');
+        mtnGrad.addColorStop(1, '#3b7850');
+      } else if (isWinterSeason) {
+        mtnGrad.addColorStop(0, '#1e293b');
+        mtnGrad.addColorStop(0.45, '#334155');
+        mtnGrad.addColorStop(1, '#64748b');
+      } else if (isAutumnSeason) {
+        // Sonbahar: Solan yapraklar, kızıl, kehribar ve pişmiş toprak tonları
+        mtnGrad.addColorStop(0, '#7c2d12');
+        mtnGrad.addColorStop(0.45, '#9a3412');
+        mtnGrad.addColorStop(1, '#b45309');
       } else {
-        mtnGrad.addColorStop(0, '#1e3a8a');
-        mtnGrad.addColorStop(0.5, '#2563eb');
-        mtnGrad.addColorStop(1, '#1d4ed8');
+        // Spring: Lush verdant coastal peaks
+        mtnGrad.addColorStop(0, '#1e3a2b');
+        mtnGrad.addColorStop(0.45, '#2d5a43');
+        mtnGrad.addColorStop(1, '#5a857b');
       }
     } else if (lvlId === 2) {
-      // Kanlısırt / Arıburnu: Rich terracotta crimson & violet clay peaks (Sarıbayır)
+      // Kanlısırt / Arıburnu: Terracotta & clay-toned crags
       if (isNight) {
-        mtnGrad.addColorStop(0, '#1c1017');
-        mtnGrad.addColorStop(1, '#0b0609');
+        mtnGrad.addColorStop(0, '#160d14');
+        mtnGrad.addColorStop(0.5, '#0e070c');
+        mtnGrad.addColorStop(1, '#070306');
       } else if (isSunset) {
-        mtnGrad.addColorStop(0, '#881337');
-        mtnGrad.addColorStop(0.5, '#9f1239');
-        mtnGrad.addColorStop(1, '#4c0519');
+        mtnGrad.addColorStop(0, '#6b1426');
+        mtnGrad.addColorStop(0.5, '#881337');
+        mtnGrad.addColorStop(1, '#9f1239');
+      } else if (isSummer) {
+        // Yaz: Akdeniz maki ve çam yeşili
+        mtnGrad.addColorStop(0, '#15381f');
+        mtnGrad.addColorStop(0.45, '#235933');
+        mtnGrad.addColorStop(1, '#447d55');
+      } else if (isWinterSeason) {
+        mtnGrad.addColorStop(0, '#1e293b');
+        mtnGrad.addColorStop(0.45, '#334155');
+        mtnGrad.addColorStop(1, '#64748b');
+      } else if (isAutumnSeason) {
+        // Sonbahar: Solan yapraklar ve sararan Arıburnu yamaçları
+        mtnGrad.addColorStop(0, '#7c2d12');
+        mtnGrad.addColorStop(0.45, '#9a3412');
+        mtnGrad.addColorStop(1, '#b45309');
       } else {
-        mtnGrad.addColorStop(0, '#4c1d24');
-        mtnGrad.addColorStop(0.5, '#6b212e');
-        mtnGrad.addColorStop(1, '#3b1219');
+        // Spring: Fresh pine-covered crags
+        mtnGrad.addColorStop(0, '#14381e');
+        mtnGrad.addColorStop(0.45, '#225d32');
+        mtnGrad.addColorStop(1, '#4d8a5e');
       }
     } else if (lvlId === 3) {
-      // Conkbayırı Zirvesi: Soaring Kaz Dağları & Mt. Ganos towering alpine crags
+      // Conkbayırı Zirvesi: Towering alpine limestone crags
       if (isNight) {
-        mtnGrad.addColorStop(0, '#111827');
-        mtnGrad.addColorStop(1, '#030712');
+        mtnGrad.addColorStop(0, '#0f172a');
+        mtnGrad.addColorStop(0.5, '#090e1a');
+        mtnGrad.addColorStop(1, '#04070d');
       } else if (isSunset) {
-        mtnGrad.addColorStop(0, '#581c87');
-        mtnGrad.addColorStop(0.5, '#7c2d12');
-        mtnGrad.addColorStop(1, '#3b0764');
+        mtnGrad.addColorStop(0, '#4a154b');
+        mtnGrad.addColorStop(0.5, '#581c87');
+        mtnGrad.addColorStop(1, '#701a75');
+      } else if (isSummer) {
+        // Yaz: Yüksek dağ çamları ve yeşil yamaçlar
+        mtnGrad.addColorStop(0, '#173b2a');
+        mtnGrad.addColorStop(0.45, '#285842');
+        mtnGrad.addColorStop(1, '#497c65');
+      } else if (isWinterSeason) {
+        mtnGrad.addColorStop(0, '#1e293b');
+        mtnGrad.addColorStop(0.45, '#334155');
+        mtnGrad.addColorStop(1, '#64748b');
+      } else if (isAutumnSeason) {
+        // Sonbahar: Solan yapraklar ve kuru meşe tonları
+        mtnGrad.addColorStop(0, '#571c0c');
+        mtnGrad.addColorStop(0.45, '#7c2d12');
+        mtnGrad.addColorStop(1, '#9a3412');
       } else {
-        mtnGrad.addColorStop(0, '#1e294b');
-        mtnGrad.addColorStop(0.5, '#2e385e');
-        mtnGrad.addColorStop(1, '#1e2238');
+        // Spring: Alpine limestone ridges with green meadows
+        mtnGrad.addColorStop(0, '#1a3328');
+        mtnGrad.addColorStop(0.45, '#285240');
+        mtnGrad.addColorStop(1, '#4f7d67');
       }
     } else {
-      // Anafartalar Zaferi: Expansive Kireçtepe & Kavaktepe ridge under golden victory skies
+      // Anafartalar Zaferi: Broad sweeping mountain ridges
       if (isNight) {
-        mtnGrad.addColorStop(0, '#0c1a16');
-        mtnGrad.addColorStop(1, '#030a08');
+        mtnGrad.addColorStop(0, '#0b1612');
+        mtnGrad.addColorStop(0.5, '#060d0a');
+        mtnGrad.addColorStop(1, '#030705');
       } else if (isSunset) {
-        mtnGrad.addColorStop(0, '#78350f');
-        mtnGrad.addColorStop(0.5, '#92400e');
-        mtnGrad.addColorStop(1, '#451a03');
+        mtnGrad.addColorStop(0, '#5c2b09');
+        mtnGrad.addColorStop(0.5, '#78350f');
+        mtnGrad.addColorStop(1, '#92400e');
+      } else if (isSummer) {
+        // Yaz: Anafartalar gür çam sırtları (solmaz)
+        mtnGrad.addColorStop(0, '#164326');
+        mtnGrad.addColorStop(0.45, '#226038');
+        mtnGrad.addColorStop(1, '#428859');
+      } else if (isWinterSeason) {
+        mtnGrad.addColorStop(0, '#1e293b');
+        mtnGrad.addColorStop(0.45, '#334155');
+        mtnGrad.addColorStop(1, '#64748b');
+      } else if (isAutumnSeason) {
+        // Sonbahar: Solan yapraklar ve sararmış tepeler
+        mtnGrad.addColorStop(0, '#7c2d12');
+        mtnGrad.addColorStop(0.45, '#9a3412');
+        mtnGrad.addColorStop(1, '#b45309');
       } else {
-        mtnGrad.addColorStop(0, '#164e63');
-        mtnGrad.addColorStop(0.5, '#155e75');
-        mtnGrad.addColorStop(1, '#115e59');
+        // Spring: Lush Anatolian steppe hills
+        mtnGrad.addColorStop(0, '#153e24');
+        mtnGrad.addColorStop(0.45, '#1e5a34');
+        mtnGrad.addColorStop(1, '#3b8555');
       }
     }
 
     ctx.fillStyle = mtnGrad;
     ctx.beginPath();
-    ctx.moveTo(0, gY);
+    const startWx0 = Math.floor(p0 / 30) * 30;
+    const endWx0 = startWx0 + this.width + 60;
+    ctx.moveTo(startWx0 - p0, gY);
 
-    for (let x = 0; x <= this.width; x += 40) {
-      const worldX = x + p0;
+    for (let wx = startWx0; wx <= endWx0; wx += 30) {
+      const sx = wx - p0;
       let h = 0;
       if (lvlId === 1) {
-        // Seddülbahir: Rolling coastal cliffs and distant Gökçeada island mass
-        h = Math.sin(worldX * 0.0006) * 70 + Math.cos(worldX * 0.0018) * 35 + 130;
+        // Seddülbahir & Aegean Horizon: Distinct peaks of Mount Ida (Kaz Dağları) & Biga range
+        h = Math.sin(wx * 0.0032) * 55 + Math.sin(wx * 0.0078) * 32 + Math.cos(wx * 0.015) * 16 + 145;
       } else if (lvlId === 2) {
-        // Arıburnu / Kanlısırt: Dramatic jagged crags with sharp ravines
-        h = Math.sin(worldX * 0.001) * 95 + Math.cos(worldX * 0.0028) * 55 + 165;
+        // Kanlısırt / Arıburnu: Dramatic jagged ridges with sharp craggy peaks
+        h = Math.sin(wx * 0.0038) * 65 + Math.sin(wx * 0.009) * 38 + Math.cos(wx * 0.018) * 18 + 155;
       } else if (lvlId === 3) {
-        // Conkbayırı: Towering high alpine peaks reaching majestic heights
-        h = Math.sin(worldX * 0.0007) * 125 + Math.cos(worldX * 0.0016) * 75 + 210;
+        // Conkbayırı: Towering high alpine peaks and crags soaring into the clouds
+        h = Math.sin(wx * 0.0028) * 80 + Math.sin(wx * 0.007) * 45 + Math.cos(wx * 0.014) * 22 + 175;
       } else {
-        // Anafartalar: Broad sweeping mountain ridges embracing the plains
-        h = Math.sin(worldX * 0.0005) * 80 + Math.cos(worldX * 0.0012) * 45 + 145;
+        // Anafartalar: Broad sweeping mountain ridges with undulating saddles
+        h = Math.sin(wx * 0.0025) * 50 + Math.sin(wx * 0.006) * 30 + Math.cos(wx * 0.012) * 15 + 140;
       }
-      ctx.lineTo(x, gY - h);
+      ctx.lineTo(sx, gY - h);
     }
-    ctx.lineTo(this.width, gY);
+    ctx.lineTo(endWx0 - p0, gY);
     ctx.closePath();
     ctx.fill();
+
+    // Mountain Crest Snow Caps (Kış Mevsiminde Yavaş Yavaş Karlanan Dağ Zirveleri)
+    if (this.winterProgress > 0.05) {
+      ctx.fillStyle = `rgba(248, 250, 252, ${(this.winterProgress * 0.95).toFixed(3)})`;
+      ctx.beginPath();
+      let first = true;
+      for (let wx = startWx0; wx <= endWx0; wx += 30) {
+        const sx = wx - p0;
+        let h = 0;
+        if (lvlId === 1) h = Math.sin(wx * 0.0032) * 55 + Math.sin(wx * 0.0078) * 32 + Math.cos(wx * 0.015) * 16 + 145;
+        else if (lvlId === 2) h = Math.sin(wx * 0.0038) * 65 + Math.sin(wx * 0.009) * 38 + Math.cos(wx * 0.018) * 18 + 155;
+        else if (lvlId === 3) h = Math.sin(wx * 0.0028) * 80 + Math.sin(wx * 0.007) * 45 + Math.cos(wx * 0.014) * 22 + 175;
+        else h = Math.sin(wx * 0.0025) * 50 + Math.sin(wx * 0.006) * 30 + Math.cos(wx * 0.012) * 15 + 140;
+
+        if (first) { ctx.moveTo(sx, gY - h); first = false; }
+        else ctx.lineTo(sx, gY - h);
+      }
+      for (let wx = endWx0; wx >= startWx0; wx -= 30) {
+        const sx = wx - p0;
+        let h = 0;
+        if (lvlId === 1) h = Math.sin(wx * 0.0032) * 55 + Math.sin(wx * 0.0078) * 32 + Math.cos(wx * 0.015) * 16 + 145;
+        else if (lvlId === 2) h = Math.sin(wx * 0.0038) * 65 + Math.sin(wx * 0.009) * 38 + Math.cos(wx * 0.018) * 18 + 155;
+        else if (lvlId === 3) h = Math.sin(wx * 0.0028) * 80 + Math.sin(wx * 0.007) * 45 + Math.cos(wx * 0.014) * 22 + 175;
+        else h = Math.sin(wx * 0.0025) * 50 + Math.sin(wx * 0.006) * 30 + Math.cos(wx * 0.012) * 15 + 140;
+
+        const snowDepth = (22 + Math.sin(wx * 0.04) * 8) * this.winterProgress;
+        ctx.lineTo(sx, gY - h + snowDepth);
+      }
+      ctx.closePath();
+      ctx.fill();
+    }
+
+    // Summer Heat Mirage / Shimmer Waves on the Distant Horizon
+    if (isSummer && !isNight) {
+      ctx.fillStyle = 'rgba(254, 240, 138, 0.12)';
+      for (let m = 0; m < 8; m++) {
+        const mx = ((m * 140 + this.animTimer * 22 - p0) % this.width + this.width) % this.width;
+        const my = gY - 125 + Math.sin(this.animTimer * 3.5 + m) * 3;
+        ctx.fillRect(mx, my, 60, 1.5);
+      }
+    }
 
     // Distant Island silhouettes for Chapter 1 (Gökçeada & Bozcaada in misty haze)
     if (lvlId === 1) {
       const islandX = 500 - p0 * 0.5;
       if (islandX > -250 && islandX < this.width + 250) {
-        ctx.fillStyle = isNight ? 'rgba(15, 23, 42, 0.6)' : (isSunset ? 'rgba(124, 45, 18, 0.45)' : 'rgba(30, 58, 138, 0.35)');
+        ctx.fillStyle = isNight ? 'rgba(12, 19, 34, 0.6)' : (isSunset ? 'rgba(88, 28, 63, 0.45)' : 'rgba(59, 83, 117, 0.40)');
         ctx.beginPath();
         ctx.moveTo(islandX - 160, gY - 60);
-        ctx.quadraticCurveTo(islandX, gY - 145, islandX + 160, gY - 60);
+        ctx.quadraticCurveTo(islandX, gY - 135, islandX + 160, gY - 60);
         ctx.closePath();
         ctx.fill();
       }
     }
 
+    // Historical 1915 Coastal Fortress Searchlight (Sweeps night sky and clouds from Dardanelles forts)
+    if (isNight && state.weather !== 'storm') {
+      const beamAngle = Math.sin(this.animTimer * 0.32) * 0.42 - 0.28;
+      const beamOriginX = (this.width * 0.68) - (camX * 0.04);
+      const beamOriginY = gY - 60;
+      const beamLen = this.height * 0.72;
+      const beamEndX = beamOriginX + Math.sin(beamAngle) * beamLen;
+      const beamEndY = beamOriginY - Math.cos(beamAngle) * beamLen;
+
+      ctx.save();
+      const beamGrad = ctx.createLinearGradient(beamOriginX, beamOriginY, beamEndX, beamEndY);
+      beamGrad.addColorStop(0, 'rgba(254, 240, 138, 0.42)');
+      beamGrad.addColorStop(0.35, 'rgba(254, 240, 138, 0.14)');
+      beamGrad.addColorStop(1, 'rgba(254, 240, 138, 0)');
+      ctx.fillStyle = beamGrad;
+      ctx.beginPath();
+      ctx.moveTo(beamOriginX, beamOriginY);
+      ctx.lineTo(beamEndX - 38, beamEndY);
+      ctx.lineTo(beamEndX + 38, beamEndY);
+      ctx.closePath();
+      ctx.fill();
+      ctx.restore();
+    }
+
+    // Distant Horizon Artillery Flash (Every ~11s, soft orange flash on the far mountain crests)
+    const artCycle = (this.animTimer * 0.09) % 1.0;
+    if (artCycle < 0.018) {
+      const flashAlpha = Math.sin((artCycle / 0.018) * Math.PI) * (isNight ? 0.45 : 0.22);
+      const flashX = (this.width * 0.44) - (camX * 0.025);
+      const flashY = gY - 145;
+      const fGrad = ctx.createRadialGradient(flashX, flashY, 2, flashX, flashY, 80);
+      fGrad.addColorStop(0, `rgba(254, 215, 170, ${flashAlpha})`);
+      fGrad.addColorStop(0.4, `rgba(249, 115, 22, ${(flashAlpha * 0.55).toFixed(3)})`);
+      fGrad.addColorStop(1, 'rgba(249, 115, 22, 0)');
+      ctx.fillStyle = fGrad;
+      ctx.beginPath();
+      ctx.arc(flashX, flashY, 80, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // --- Layer 0B: Anatolian Coast Foothills & Far Shoreline of the Strait (Parallax 0.05) ---
+    const p0b = camX * 0.05;
+    let coastGrad = ctx.createLinearGradient(0, gY - 120, 0, gY);
+    if (lvlId === 1) {
+      coastGrad.addColorStop(0, isNight ? '#080d18' : (isSunset ? '#50162e' : '#293d56'));
+      coastGrad.addColorStop(1, isNight ? '#050810' : (isSunset ? '#681c3c' : '#395373'));
+    } else if (lvlId === 2) {
+      coastGrad.addColorStop(0, isNight ? '#0e070c' : (isSunset ? '#5c1020' : '#452b32'));
+      coastGrad.addColorStop(1, isNight ? '#080306' : (isSunset ? '#78152a' : '#573840'));
+    } else if (lvlId === 3) {
+      coastGrad.addColorStop(0, isNight ? '#090e1a' : (isSunset ? '#3b1057' : '#253042'));
+      coastGrad.addColorStop(1, isNight ? '#05080e' : (isSunset ? '#4a156e' : '#334155'));
+    } else {
+      coastGrad.addColorStop(0, isNight ? '#070f0c' : (isSunset ? '#452007' : '#223832'));
+      coastGrad.addColorStop(1, isNight ? '#030806' : (isSunset ? '#592909' : '#2f4c44'));
+    }
+
+    ctx.fillStyle = coastGrad;
+    ctx.beginPath();
+    const startWx0b = Math.floor(p0b / 30) * 30;
+    const endWx0b = startWx0b + this.width + 60;
+    ctx.moveTo(startWx0b - p0b, gY);
+    for (let wx = startWx0b; wx <= endWx0b; wx += 30) {
+      const sx = wx - p0b;
+      const hCoast = Math.sin(wx * 0.005) * 26 + Math.cos(wx * 0.012) * 14 + 75;
+      ctx.lineTo(sx, gY - hCoast);
+    }
+    ctx.lineTo(endWx0b - p0b, gY);
+    ctx.closePath();
+    ctx.fill();
+
     // --- 2. Layer 1: Çanakkale Boğazı (Dardanelles / Suvla Bay / Saros) & Battleship Fleet (Parallax 0.08) ---
     const p1 = camX * 0.08;
-    const waterHorizon = gY - 62;
+    const waterHorizon = gY - 66;
 
-    // Calm, sparkling Water Strip
-    const seaGrad = ctx.createLinearGradient(0, waterHorizon, 0, waterHorizon + 32);
+    // Distant Shoreline Highlight
+    ctx.fillStyle = isNight ? 'rgba(255, 255, 255, 0.08)' : (isSunset ? 'rgba(254, 215, 170, 0.35)' : 'rgba(224, 242, 254, 0.45)');
+    ctx.fillRect(0, waterHorizon - 1, this.width, 1.5);
+
+    // Calm, sparkling Water Strip with realistic maritime tones
+    const seaGrad = ctx.createLinearGradient(0, waterHorizon, 0, waterHorizon + 34);
     if (lvlId === 2) {
       // Anzac Cove turquoise & deep indigo
-      seaGrad.addColorStop(0, isNight ? '#030712' : (isSunset ? '#831843' : '#0284c7'));
-      seaGrad.addColorStop(1, isNight ? '#0f172a' : (isSunset ? '#9f1239' : '#0369a1'));
+      seaGrad.addColorStop(0, isNight ? '#020617' : (isSunset ? '#701a40' : '#0284c7'));
+      seaGrad.addColorStop(0.5, isNight ? '#081122' : (isSunset ? '#881337' : '#0ea5e9'));
+      seaGrad.addColorStop(1, isNight ? '#0f172a' : (isSunset ? '#9f1239' : '#0284c7'));
     } else if (lvlId === 4) {
       // Suvla Bay with salt flat reflections
-      seaGrad.addColorStop(0, isNight ? '#040d12' : (isSunset ? '#78350f' : '#0d9488'));
-      seaGrad.addColorStop(1, isNight ? '#082f49' : (isSunset ? '#b45309' : '#0f766e'));
+      seaGrad.addColorStop(0, isNight ? '#030b0e' : (isSunset ? '#5c2b09' : '#0d9488'));
+      seaGrad.addColorStop(0.5, isNight ? '#06171d' : (isSunset ? '#78350f' : '#14b8a6'));
+      seaGrad.addColorStop(1, isNight ? '#0a232c' : (isSunset ? '#92400e' : '#0f766e'));
     } else {
       // Dardanelles Strait azure
-      seaGrad.addColorStop(0, isNight ? '#030712' : (isSunset ? '#7c2d12' : '#1d4ed8'));
-      seaGrad.addColorStop(1, isNight ? '#0f172a' : (isSunset ? '#9a3412' : '#1e40af'));
+      seaGrad.addColorStop(0, isNight ? '#020617' : (isSunset ? '#581c3f' : '#1d4ed8'));
+      seaGrad.addColorStop(0.5, isNight ? '#071226' : (isSunset ? '#701a40' : '#2563eb'));
+      seaGrad.addColorStop(1, isNight ? '#0d1d3a' : (isSunset ? '#881337' : '#1e40af'));
     }
     ctx.fillStyle = seaGrad;
-    ctx.fillRect(0, waterHorizon, this.width, 32);
+    ctx.fillRect(0, waterHorizon, this.width, 34);
+
+    // Atmospheric Horizon Haze line softly blending the distant Anatolian coast with the strait
+    const horizHaze = ctx.createLinearGradient(0, waterHorizon - 14, 0, waterHorizon + 8);
+    const hazeColor = isNight ? '15, 23, 42' : (isSunset ? '251, 146, 60' : '224, 242, 254');
+    horizHaze.addColorStop(0, `rgba(${hazeColor}, 0)`);
+    horizHaze.addColorStop(0.5, `rgba(${hazeColor}, ${isNight ? '0.22' : (isSunset ? '0.32' : '0.35')})`);
+    horizHaze.addColorStop(1, `rgba(${hazeColor}, 0)`);
+    ctx.fillStyle = horizHaze;
+    ctx.fillRect(0, waterHorizon - 14, this.width, 22);
 
     // Dynamic Celestial Water Shimmer
     const celProgress = p <= 0.71 ? (p / 0.70) : (p >= 0.68 ? (p - 0.68) / 0.36 : (p + 0.32) / 0.36);
@@ -619,6 +915,9 @@ export class GameRenderer {
       const shipWorldX = 420 + b * 980;
       const screenShipX = shipWorldX - p1;
       if (screenShipX > -180 && screenShipX < this.width + 180) {
+        // Soft water shadow beneath hull
+        ctx.fillStyle = isNight ? 'rgba(0, 0, 0, 0.45)' : 'rgba(15, 23, 42, 0.35)';
+        ctx.fillRect(screenShipX - 58, waterHorizon + 12, 116, 2.5);
         this.drawDistantWarship(screenShipX, waterHorizon + 12, state, b);
       }
     }
@@ -628,42 +927,75 @@ export class GameRenderer {
     
     let ridgeColor = '#1e293b';
     if (lvlId === 1) {
-      // Seddülbahir sandstone ridge
-      ridgeColor = isNight ? '#0b1319' : (isSunset ? '#451a03' : '#334e38');
+      // Seddülbahir coastal pine ridge
+      ridgeColor = isNight ? '#0b1319' : (isSunset ? '#451a03' : (isSummer ? '#1e4d2b' : (isWinterSeason ? '#334155' : (isAutumnSeason ? '#7c2d12' : '#225d30'))));
     } else if (lvlId === 2) {
-      // Kanlısırt / Arıburnu terracotta ridge
-      ridgeColor = isNight ? '#140c10' : (isSunset ? '#4c0519' : '#57222c');
+      // Kanlısırt / Arıburnu evergreen pine & scrub
+      ridgeColor = isNight ? '#140c10' : (isSunset ? '#4c0519' : (isSummer ? '#24562f' : (isWinterSeason ? '#334155' : (isAutumnSeason ? '#7c2d12' : '#3d5a28'))));
     } else if (lvlId === 3) {
-      // Conkbayırı high limestone ridge
-      ridgeColor = isNight ? '#0a0e17' : (isSunset ? '#2e1065' : '#2b3548');
+      // Conkbayırı high mountain pine ridge
+      ridgeColor = isNight ? '#0a0e17' : (isSunset ? '#2e1065' : (isSummer ? '#1f4835' : (isWinterSeason ? '#334155' : (isAutumnSeason ? '#571c0c' : '#285240'))));
     } else {
-      // Anafartalar steppe hills
-      ridgeColor = isNight ? '#06130d' : (isSunset ? '#3b1d06' : '#234426');
+      // Anafartalar evergreen steppe hills
+      ridgeColor = isNight ? '#06130d' : (isSunset ? '#3b1d06' : (isSummer ? '#1c4d28' : (isWinterSeason ? '#334155' : (isAutumnSeason ? '#7c2d12' : '#225d2b'))));
     }
 
     ctx.fillStyle = ridgeColor;
     ctx.beginPath();
-    ctx.moveTo(0, gY);
-    for (let x = 0; x <= this.width; x += 30) {
-      const worldX = x + p2;
+    const startWx2 = Math.floor(p2 / 30) * 30;
+    const endWx2 = startWx2 + this.width + 60;
+    ctx.moveTo(startWx2 - p2, gY);
+    for (let wx = startWx2; wx <= endWx2; wx += 30) {
+      const sx = wx - p2;
       let h = 0;
       if (lvlId === 1) {
-        h = Math.sin(worldX * 0.0022) * 35 + Math.cos(worldX * 0.005) * 22 + 65;
+        h = Math.sin(wx * 0.0022) * 35 + Math.cos(wx * 0.005) * 22 + 65;
       } else if (lvlId === 2) {
         // Dramatic steep ravines (Plugge's plateau profile)
-        h = Math.sin(worldX * 0.0032) * 55 + Math.cos(worldX * 0.007) * 32 + 85;
+        h = Math.sin(wx * 0.0032) * 55 + Math.cos(wx * 0.007) * 32 + 85;
       } else if (lvlId === 3) {
         // Conkbayırı high rocky ridge
-        h = Math.sin(worldX * 0.0025) * 65 + Math.cos(worldX * 0.0055) * 38 + 95;
+        h = Math.sin(wx * 0.0025) * 65 + Math.cos(wx * 0.0055) * 38 + 95;
       } else {
         // Anafartalar rolling downs
-        h = Math.sin(worldX * 0.0018) * 30 + Math.cos(worldX * 0.004) * 18 + 55;
+        h = Math.sin(wx * 0.0018) * 30 + Math.cos(wx * 0.004) * 18 + 55;
       }
-      ctx.lineTo(x, gY - h);
+      ctx.lineTo(sx, gY - h);
     }
-    ctx.lineTo(this.width, gY);
+    ctx.lineTo(endWx2 - p2, gY);
     ctx.closePath();
     ctx.fill();
+
+    // Ridge Snow Caps in Winter (Sırtlarda Yavaş Yavaş Biriken Kar Örtüsü)
+    if (this.winterProgress > 0.05) {
+      ctx.fillStyle = `rgba(241, 245, 249, ${(this.winterProgress * 0.90).toFixed(3)})`;
+      ctx.beginPath();
+      let first = true;
+      for (let wx = startWx2; wx <= endWx2; wx += 30) {
+        const sx = wx - p2;
+        let h = 0;
+        if (lvlId === 1) h = Math.sin(wx * 0.0022) * 35 + Math.cos(wx * 0.005) * 22 + 65;
+        else if (lvlId === 2) h = Math.sin(wx * 0.0032) * 55 + Math.cos(wx * 0.007) * 32 + 85;
+        else if (lvlId === 3) h = Math.sin(wx * 0.0025) * 65 + Math.cos(wx * 0.0055) * 38 + 95;
+        else h = Math.sin(wx * 0.0018) * 30 + Math.cos(wx * 0.004) * 18 + 55;
+
+        if (first) { ctx.moveTo(sx, gY - h); first = false; }
+        else ctx.lineTo(sx, gY - h);
+      }
+      for (let wx = endWx2; wx >= startWx2; wx -= 30) {
+        const sx = wx - p2;
+        let h = 0;
+        if (lvlId === 1) h = Math.sin(wx * 0.0022) * 35 + Math.cos(wx * 0.005) * 22 + 65;
+        else if (lvlId === 2) h = Math.sin(wx * 0.0032) * 55 + Math.cos(wx * 0.007) * 32 + 85;
+        else if (lvlId === 3) h = Math.sin(wx * 0.0025) * 65 + Math.cos(wx * 0.0055) * 38 + 95;
+        else h = Math.sin(wx * 0.0018) * 30 + Math.cos(wx * 0.004) * 18 + 55;
+
+        const snowDepth = (14 + Math.sin(wx * 0.06) * 5) * this.winterProgress;
+        ctx.lineTo(sx, gY - h + snowDepth);
+      }
+      ctx.closePath();
+      ctx.fill();
+    }
 
     // Chapter 2 Special Landmark: The Famous Sphinx Rock (Sfenks Tepesi) of Arıburnu
     if (lvlId === 2) {
@@ -772,13 +1104,15 @@ export class GameRenderer {
 
     ctx.fillStyle = foreHillColor;
     ctx.beginPath();
-    ctx.moveTo(0, gY);
-    for (let x = 0; x <= this.width; x += 25) {
-      const worldX = x + p3;
-      const h = Math.sin(worldX * 0.005) * 25 + Math.cos(worldX * 0.012) * 14 + 38;
-      ctx.lineTo(x, gY - h);
+    const startWx3 = Math.floor(p3 / 25) * 25;
+    const endWx3 = startWx3 + this.width + 50;
+    ctx.moveTo(startWx3 - p3, gY);
+    for (let wx = startWx3; wx <= endWx3; wx += 25) {
+      const sx = wx - p3;
+      const h = Math.sin(wx * 0.005) * 25 + Math.cos(wx * 0.012) * 14 + 38;
+      ctx.lineTo(sx, gY - h);
     }
-    ctx.lineTo(this.width, gY);
+    ctx.lineTo(endWx3 - p3, gY);
     ctx.closePath();
     ctx.fill();
 
@@ -889,79 +1223,135 @@ export class GameRenderer {
     const ctx = this.ctx;
     const gY = this.groundY;
     const lvlId = state.level.id;
+    const currentKey = `${lvlId}_${state.season}_${this.width}_${this.height}`;
 
-    // Historical Gallipoli Soil adapted per Chapter
-    const groundGrad = ctx.createLinearGradient(0, gY, 0, this.height);
-    if (state.season === 'winter') {
-      groundGrad.addColorStop(0, '#f1f5f9');
-      groundGrad.addColorStop(0.1, '#cbd5e1');
-      groundGrad.addColorStop(0.35, '#64748b');
-      groundGrad.addColorStop(0.7, '#334155');
-      groundGrad.addColorStop(1, '#0f172a');
-    } else if (state.season === 'autumn') {
-      groundGrad.addColorStop(0, '#854d0e');
-      groundGrad.addColorStop(0.08, '#713f12');
-      groundGrad.addColorStop(0.3, '#572c0c');
-      groundGrad.addColorStop(0.7, '#3b1d06');
-      groundGrad.addColorStop(1, '#1c0f04');
-    } else {
-      if (lvlId === 1) {
-        // Seddülbahir Coastal Sandstone & Beach Loam
-        groundGrad.addColorStop(0, '#5a6828'); // Coastal dune scrub
-        groundGrad.addColorStop(0.06, '#785c2c'); // Sandstone topsoil
-        groundGrad.addColorStop(0.20, '#664a20'); // Golden coastal sediment
-        groundGrad.addColorStop(0.50, '#4a3314'); // Compressed sandstone
-        groundGrad.addColorStop(0.80, '#2d1e0a'); // Basal rock
-        groundGrad.addColorStop(1, '#140c04');
-      } else if (lvlId === 2) {
-        // Kanlısırt / Arıburnu Iconic Gallipoli Blood-Red Clay (Kızıl Toprak)
-        groundGrad.addColorStop(0, '#4a5e20'); // Pine moss surface
-        groundGrad.addColorStop(0.06, '#7c2d12'); // Rich Kanlısırt red clay
-        groundGrad.addColorStop(0.20, '#6c240e'); // Deep terracotta strata
-        groundGrad.addColorStop(0.50, '#4d1708'); // Dense red mudstone
-        groundGrad.addColorStop(0.80, '#2e0b04'); // Dark bedrock
-        groundGrad.addColorStop(1, '#150502');
-      } else if (lvlId === 3) {
-        // Conkbayırı High Mountain Limestone & Scree
-        groundGrad.addColorStop(0, '#4b5535'); // High mountain alpine moss
-        groundGrad.addColorStop(0.06, '#47473f'); // Limestone gravel topsoil
-        groundGrad.addColorStop(0.20, '#383832'); // Rocky shale strata
-        groundGrad.addColorStop(0.50, '#282824'); // Hard limestone bedrock
-        groundGrad.addColorStop(0.80, '#1c1c19'); // Deep mountain rock
-        groundGrad.addColorStop(1, '#0e0e0c');
+    // Persistent Offscreen Terrain Buffer (Renders once per level/season/resolution change)
+    if (this.terrainBufferKey !== currentKey) {
+      this.terrainBufferCanvas.width = this.width;
+      this.terrainBufferCanvas.height = this.height - gY;
+      const tCtx = this.terrainBufferCtx;
+
+      // Historical Gallipoli Soil adapted per Chapter
+      const groundGrad = tCtx.createLinearGradient(0, 0, 0, this.height - gY);
+      if (state.season === 'winter') {
+        // Soğuk kış toprağı (Koyu nemli balçık) - Kar örtüsü winterProgress ile dinamik ve kademeli birikir!
+        groundGrad.addColorStop(0, '#263140');
+        groundGrad.addColorStop(0.08, '#1e293b');
+        groundGrad.addColorStop(0.3, '#172033');
+        groundGrad.addColorStop(0.7, '#0f172a');
+        groundGrad.addColorStop(1, '#020617');
+      } else if (state.season === 'autumn') {
+        groundGrad.addColorStop(0, '#854d0e');
+        groundGrad.addColorStop(0.08, '#713f12');
+        groundGrad.addColorStop(0.3, '#572c0c');
+        groundGrad.addColorStop(0.7, '#3b1d06');
+        groundGrad.addColorStop(1, '#1c0f04');
+      } else if (state.season === 'summer') {
+        // Kızgın güneş altında kavrulmuş sarı-kahverengi kuru bozkır toprağı
+        groundGrad.addColorStop(0, '#a16207'); // Kurumuş saman rengi üst kabuk
+        groundGrad.addColorStop(0.06, '#854d0e'); // Güneşten çatlamış sarı kil
+        groundGrad.addColorStop(0.20, '#78350f'); // Kuru kumlu balçık
+        groundGrad.addColorStop(0.50, '#572c0c'); // Sertleşmiş kuru toprak
+        groundGrad.addColorStop(0.80, '#3b1d06'); // Ana kaya
+        groundGrad.addColorStop(1, '#1c0f04');
       } else {
-        // Anafartalar Fertile Steppe Soil
-        groundGrad.addColorStop(0, '#4d6d24'); // Lush Anatolian steppe grass
-        groundGrad.addColorStop(0.06, '#4a3d1b'); // Fertile alluvial loam
-        groundGrad.addColorStop(0.20, '#5c481e'); // Silt & clay
-        groundGrad.addColorStop(0.50, '#3e2f12'); // Dense siltstone
-        groundGrad.addColorStop(0.80, '#281d0a'); // Deep bedrock
-        groundGrad.addColorStop(1, '#130d04');
+        if (lvlId === 1) {
+          // Seddülbahir Coastal Sandstone & Beach Loam
+          groundGrad.addColorStop(0, '#5a6828'); // Coastal dune scrub
+          groundGrad.addColorStop(0.06, '#785c2c'); // Sandstone topsoil
+          groundGrad.addColorStop(0.20, '#664a20'); // Golden coastal sediment
+          groundGrad.addColorStop(0.50, '#4a3314'); // Compressed sandstone
+          groundGrad.addColorStop(0.80, '#2d1e0a'); // Basal rock
+          groundGrad.addColorStop(1, '#140c04');
+        } else if (lvlId === 2) {
+          // Kanlısırt / Arıburnu Iconic Gallipoli Blood-Red Clay (Kızıl Toprak)
+          groundGrad.addColorStop(0, '#4a5e20'); // Pine moss surface
+          groundGrad.addColorStop(0.06, '#7c2d12'); // Rich Kanlısırt red clay
+          groundGrad.addColorStop(0.20, '#6c240e'); // Deep terracotta strata
+          groundGrad.addColorStop(0.50, '#4d1708'); // Dense red mudstone
+          groundGrad.addColorStop(0.80, '#2e0b04'); // Dark bedrock
+          groundGrad.addColorStop(1, '#150502');
+        } else if (lvlId === 3) {
+          // Conkbayırı High Mountain Limestone & Scree
+          groundGrad.addColorStop(0, '#4b5535'); // High mountain alpine moss
+          groundGrad.addColorStop(0.06, '#47473f'); // Limestone gravel topsoil
+          groundGrad.addColorStop(0.20, '#383832'); // Rocky shale strata
+          groundGrad.addColorStop(0.50, '#282824'); // Hard limestone bedrock
+          groundGrad.addColorStop(0.80, '#1c1c19'); // Deep mountain rock
+          groundGrad.addColorStop(1, '#0e0e0c');
+        } else {
+          // Anafartalar Fertile Steppe Soil
+          groundGrad.addColorStop(0, '#4d6d24'); // Lush Anatolian steppe grass
+          groundGrad.addColorStop(0.06, '#4a3d1b'); // Fertile alluvial loam
+          groundGrad.addColorStop(0.20, '#5c481e'); // Silt & clay
+          groundGrad.addColorStop(0.50, '#3e2f12'); // Dense siltstone
+          groundGrad.addColorStop(0.80, '#281d0a'); // Deep bedrock
+          groundGrad.addColorStop(1, '#130d04');
+        }
+      }
+
+      tCtx.fillStyle = groundGrad;
+      tCtx.fillRect(0, 0, this.width, this.height - gY);
+
+      // Geological Sediment Strata
+      let strataColors = ['rgba(84, 50, 20, 0.3)', 'rgba(60, 32, 12, 0.35)', 'rgba(35, 18, 6, 0.4)'];
+      if (state.season === 'winter') {
+        strataColors = ['rgba(148, 163, 184, 0.25)', 'rgba(71, 85, 105, 0.3)', 'rgba(30, 41, 59, 0.35)'];
+      } else if (lvlId === 2) {
+        strataColors = ['rgba(153, 27, 27, 0.35)', 'rgba(127, 29, 29, 0.4)', 'rgba(69, 10, 10, 0.45)'];
+      } else if (lvlId === 3) {
+        strataColors = ['rgba(100, 116, 139, 0.3)', 'rgba(71, 85, 105, 0.35)', 'rgba(30, 41, 59, 0.4)'];
+      }
+
+      // Stratum 1: Subsurface clay layer
+      tCtx.fillStyle = strataColors[0];
+      tCtx.fillRect(0, 12, this.width, 3);
+      // Stratum 2: Limestone & chalk sedimentary band
+      tCtx.fillStyle = strataColors[1];
+      tCtx.fillRect(0, 36, this.width, 4);
+      // Stratum 3: Deep shale bedrock band
+      tCtx.fillStyle = strataColors[2];
+      tCtx.fillRect(0, 75, this.width, 5);
+
+      this.terrainBufferKey = currentKey;
+    }
+
+    // Direct 1-call GPU texture blit for static ground & strata (0 ms CPU cost)
+    ctx.drawImage(this.terrainBufferCanvas, 0, gY);
+
+    // Dynamic Progressive Snow Blanket (Kışa Geçişte Kademeli Kar Yağdıkça Biriken Kar Örtüsü)
+    if (this.winterProgress > 0.01) {
+      const wProg = this.winterProgress;
+      const snowH = wProg * 8.5;
+      const snowAlpha = Math.min(1.0, wProg * 1.08);
+
+      const snowGrad = ctx.createLinearGradient(0, gY - snowH, 0, gY + 16 * wProg);
+      snowGrad.addColorStop(0, `rgba(255, 255, 255, ${snowAlpha.toFixed(3)})`);
+      snowGrad.addColorStop(0.28, `rgba(248, 250, 252, ${(snowAlpha * 0.96).toFixed(3)})`);
+      snowGrad.addColorStop(0.65, `rgba(226, 232, 240, ${(snowAlpha * 0.88).toFixed(3)})`);
+      snowGrad.addColorStop(0.88, `rgba(203, 213, 225, ${(snowAlpha * 0.55).toFixed(3)})`);
+      snowGrad.addColorStop(1, 'rgba(100, 116, 139, 0)');
+
+      ctx.fillStyle = snowGrad;
+      ctx.beginPath();
+      ctx.moveTo(0, gY + 16 * wProg);
+      for (let x = 0; x <= this.width + 20; x += 14) {
+        const worldX = x + camX;
+        const mound = (Math.sin(worldX * 0.035) * 2.2 + Math.cos(worldX * 0.08) * 1.4) * wProg;
+        ctx.lineTo(x, gY - snowH + mound);
+      }
+      ctx.lineTo(this.width, gY + 16 * wProg);
+      ctx.closePath();
+      ctx.fill();
+
+      // Sparkling Snow Diamond Crystals (Pırıltılı Kar Kristalleri)
+      ctx.fillStyle = `rgba(255, 255, 255, ${(wProg * 0.85).toFixed(3)})`;
+      for (let sp = 0; sp < 18; sp++) {
+        const spX = ((sp * 79 + Math.sin(sp * 11) * 20 - camX * 0.2) % this.width + this.width) % this.width;
+        const spMound = (Math.sin((spX + camX) * 0.035) * 2.2) * wProg;
+        ctx.fillRect(spX, gY - snowH + spMound, 1.5, 1.5);
       }
     }
-
-    ctx.fillStyle = groundGrad;
-    ctx.fillRect(0, gY, this.width, this.height - gY);
-
-    // Geological Sediment Strata (Sakin, Gözü Yormayan Sabit Jeolojik Katmanlar)
-    let strataColors = ['rgba(84, 50, 20, 0.3)', 'rgba(60, 32, 12, 0.35)', 'rgba(35, 18, 6, 0.4)'];
-    if (state.season === 'winter') {
-      strataColors = ['rgba(148, 163, 184, 0.25)', 'rgba(71, 85, 105, 0.3)', 'rgba(30, 41, 59, 0.35)'];
-    } else if (lvlId === 2) {
-      strataColors = ['rgba(153, 27, 27, 0.35)', 'rgba(127, 29, 29, 0.4)', 'rgba(69, 10, 10, 0.45)'];
-    } else if (lvlId === 3) {
-      strataColors = ['rgba(100, 116, 139, 0.3)', 'rgba(71, 85, 105, 0.35)', 'rgba(30, 41, 59, 0.4)'];
-    }
-
-    // Stratum 1: Subsurface clay layer
-    ctx.fillStyle = strataColors[0];
-    ctx.fillRect(0, gY + 12, this.width, 3);
-    // Stratum 2: Limestone & chalk sedimentary band
-    ctx.fillStyle = strataColors[1];
-    ctx.fillRect(0, gY + 36, this.width, 4);
-    // Stratum 3: Deep shale bedrock band
-    ctx.fillStyle = strataColors[2];
-    ctx.fillRect(0, gY + 75, this.width, 5);
 
     // Sea / Water at map edges (Çanakkale Boğazı & Ege Kıyısı - Realist Dalgalar ve Islak Kum)
     const leftBeachX = 260 - camX;
@@ -1026,164 +1416,496 @@ export class GameRenderer {
     const gY = this.groundY;
 
     const isWinter = state.season === 'winter';
+    const isSummer = state.season === 'summer';
     const isAutumn = state.season === 'autumn';
+
+    // Kış mevsiminde çimenlerin opaklığını zamanla azaltan ve yerine kar katmanı getiren geçiş animasyonu (tweening)
+    const grassOpacity = isWinter ? Math.max(0, 1.0 - this.winterProgress * 0.95) : 1.0;
+    const winterBladeScale = isWinter ? Math.max(0.2, 1.0 - this.winterProgress * 0.45) : 1.0;
 
     const grassBaseColors = isWinter 
       ? ['#cbd5e1', '#e2e8f0', '#94a3b8'] 
       : (isAutumn 
         ? ['#78350f', '#9a3412', '#b45309'] 
-        : ['#14532d', '#15803d', '#3f6212']);
+        : (isSummer
+          ? ['#78350f', '#854d0e', '#a16207'] // Yaz: Kavrulmuş kuru kökler
+          : ['#14532d', '#15803d', '#166534'])); // Bahar: Yemyeşil taze kökler
 
     const grassTipColors = isWinter 
       ? ['#f8fafc', '#ffffff', '#e2e8f0'] 
       : (isAutumn 
         ? ['#d97706', '#f59e0b', '#b45309'] 
-        : ['#4d7c0f', '#65a30d', '#84cc16']);
+        : (isSummer
+          ? ['#ca8a04', '#eab308', '#d97706'] // Yaz: Sarı altın bozkır otları
+          : ['#22c55e', '#4ade80', '#16a34a'])); // Bahar: Zümrüt yeşili taze filizler
 
-    const forestTrees = (slots || []).filter((s) => s.type === 'scavenge_wood');
-    const leftStandingTrees = forestTrees.filter((s) => s.side === 'left' && !s.isScavenged);
-    const rightStandingTrees = forestTrees.filter((s) => s.side === 'right' && !s.isScavenged);
-
-    const leftForestEdgeX = leftStandingTrees.length > 0 ? Math.max(...leftStandingTrees.map((t) => t.x)) + 60 : -9999;
-    const rightForestEdgeX = rightStandingTrees.length > 0 ? Math.min(...rightStandingTrees.map((t) => t.x)) - 60 : 999999;
-
-    const step = 5;
-    const startX = -(camX % step);
-    for (let sx = startX; sx < this.width + 15; sx += step) {
-      const worldX = sx + camX;
-      if (worldX < 285 || worldX > state.level.worldWidth - 285) continue;
-
-      // Base grass presence inside the wild forest bounds (Kurulu hududun dışındaki ormanlık alanlar)
-      let forestGrassFactor = 0;
-      if (worldX <= leftForestEdgeX && worldX >= 300) {
-        const edgeDist = leftForestEdgeX - worldX;
-        forestGrassFactor = Math.min(1.0, 0.55 + edgeDist / 70);
-      } else if (worldX >= rightForestEdgeX && worldX <= state.level.worldWidth - 300) {
-        const edgeDist = worldX - rightForestEdgeX;
-        forestGrassFactor = Math.min(1.0, 0.55 + edgeDist / 70);
-      }
-
-      // Proximity to individual trees (standing trees enhance lushness; cut trees wither away grass)
-      for (let t = 0; t < forestTrees.length; t++) {
-        const tree = forestTrees[t];
-        const dist = Math.abs(tree.x - worldX);
-        if (dist < 120) {
-          const proximity = Math.max(0, 1 - dist / 120);
-          if (tree.isScavenged) {
-            // Cleared stump area: grass withers and disappears as area is cleared
-            const clearedProg = tree.clearedProgress ?? 1.0;
-            const withering = Math.max(0, 1 - clearedProg);
-            const suppression = proximity * (1 - withering);
-            forestGrassFactor *= Math.max(0, 1 - suppression);
-          } else {
-            const treeBonus = proximity * 0.45;
-            if (treeBonus > forestGrassFactor) {
-              forestGrassFactor = Math.min(1.0, forestGrassFactor + treeBonus);
-            }
+    // Zero-allocation tree proximity filtering using pre-allocated cache
+    this.cachedVisibleTrees.length = 0;
+    let leftForestEdgeX = -9999;
+    let rightForestEdgeX = 999999;
+    if (slots) {
+      for (let i = 0; i < slots.length; i++) {
+        const s = slots[i];
+        if (s.type === 'scavenge_wood') {
+          if (!s.isScavenged) {
+            if (s.side === 'left' && s.x + 60 > leftForestEdgeX) leftForestEdgeX = s.x + 60;
+            if (s.side === 'right' && s.x - 60 < rightForestEdgeX) rightForestEdgeX = s.x - 60;
+          }
+          if (s.x >= camX - 120 && s.x <= camX + this.width + 120) {
+            this.cachedVisibleTrees.push(s);
           }
         }
       }
+    }
 
-      if (forestGrassFactor <= 0.04) continue;
+    const step = 16;
+    // Anchor to fixed world coordinates to guarantee 0 jitter and 0 subpixel tearing while running
+    const startWx = Math.floor((camX - 20) / step) * step;
+    const endWx = Math.ceil((camX + this.width + 20) / step) * step;
+    const numTipColors = grassTipColors.length;
+    const visibleTreesCount = this.cachedVisibleTrees.length;
 
-      // Realistic multi-frequency wind physics
-      const seed = Math.abs(worldX);
-      const windSway = Math.sin(this.animTimer * 1.5 + worldX * 0.02) * 3.6 + Math.sin(this.animTimer * 3.0 + worldX * 0.06) * 1.2;
-      const baseBladeH = (10 + (seed % 7) + (Math.sin(worldX * 0.07) * 4)) * forestGrassFactor;
+    // Direct multi-pass zero-allocation batched stroke loops (1 draw call per color group, 0 heap objects allocated)
+    if (grassOpacity > 0.02) {
+      ctx.save();
+      ctx.globalAlpha *= grassOpacity;
 
-      // Cluster Blade 1: Main central blade
-      const colorIdx = seed % grassBaseColors.length;
-      ctx.strokeStyle = grassTipColors[colorIdx];
-      ctx.lineWidth = 1.6;
-      ctx.beginPath();
-      ctx.moveTo(sx, gY);
-      ctx.quadraticCurveTo(sx + windSway * 0.4, gY - baseBladeH * 0.55, sx + windSway * forestGrassFactor, gY - baseBladeH);
-      ctx.stroke();
-
-      // Cluster Blade 2: Left curving blade (darker root shade)
-      if (forestGrassFactor > 0.3) {
-        const leftH = baseBladeH * 0.78;
-        ctx.strokeStyle = grassBaseColors[(colorIdx + 1) % grassBaseColors.length];
-        ctx.lineWidth = 1.3;
+      for (let c = 0; c < numTipColors; c++) {
+        let hasBlades = false;
+        ctx.strokeStyle = grassTipColors[c];
+        ctx.lineWidth = 1.5;
         ctx.beginPath();
-        ctx.moveTo(sx - 2, gY);
-        ctx.quadraticCurveTo(sx - 3 + windSway * 0.25, gY - leftH * 0.5, sx - 4 + windSway * 0.7, gY - leftH);
-        ctx.stroke();
-      }
 
-      // Cluster Blade 3: Right leaning blade (sunlit highlight)
-      if (forestGrassFactor > 0.5 && seed % 2 === 0) {
-        const rightH = baseBladeH * 0.65;
-        ctx.strokeStyle = grassTipColors[(colorIdx + 2) % grassTipColors.length];
-        ctx.lineWidth = 1.1;
-        ctx.beginPath();
-        ctx.moveTo(sx + 2, gY);
-        ctx.quadraticCurveTo(sx + 3 + windSway * 0.3, gY - rightH * 0.5, sx + 4 + windSway * 0.8, gY - rightH);
-        ctx.stroke();
-      }
+        for (let worldX = startWx; worldX <= endWx; worldX += step) {
+          if (worldX < 285 || worldX > state.level.worldWidth - 285) continue;
+          const seed = Math.abs(worldX);
+          if ((seed % numTipColors) !== c) continue;
 
-      // Gelibolu Wild Flora (Authentic Red Steppe Poppies & Field Buttercups)
-      if (forestGrassFactor > 0.45 && !isWinter) {
-        if (seed % 43 < 3) {
-          // Red Poppy (Gelincik)
-          const flowerX = sx + windSway * forestGrassFactor * 0.95;
-          const flowerY = gY - baseBladeH - 1.5;
-          ctx.fillStyle = '#dc2626';
-          ctx.beginPath();
-          ctx.arc(flowerX, flowerY, 2.5 * forestGrassFactor, 0, Math.PI * 2);
-          ctx.fill();
-          // Black velvet pistil center
-          ctx.fillStyle = '#09090b';
-          ctx.fillRect(flowerX - 0.7, flowerY - 0.7, 1.4, 1.4);
-        } else if (seed % 67 < 2) {
-          // Yellow Buttercup (Düğün Çiçeği)
-          const flowerX = sx + windSway * forestGrassFactor * 0.8;
-          const flowerY = gY - baseBladeH * 0.85;
-          ctx.fillStyle = '#facc15';
-          ctx.beginPath();
-          ctx.arc(flowerX, flowerY, 1.8 * forestGrassFactor, 0, Math.PI * 2);
-          ctx.fill();
-          ctx.fillStyle = '#ca8a04';
-          ctx.fillRect(flowerX - 0.5, flowerY - 0.5, 1, 1);
+          let forestGrassFactor = 0;
+          if (worldX <= leftForestEdgeX && worldX >= 300) {
+            const edgeDist = leftForestEdgeX - worldX;
+            forestGrassFactor = Math.min(1.0, 0.55 + edgeDist / 70);
+          } else if (worldX >= rightForestEdgeX && worldX <= state.level.worldWidth - 300) {
+            const edgeDist = worldX - rightForestEdgeX;
+            forestGrassFactor = Math.min(1.0, 0.55 + edgeDist / 70);
+          }
+
+          // Fast proximity check to visible trees
+          for (let t = 0; t < visibleTreesCount; t++) {
+            const tree = this.cachedVisibleTrees[t];
+            const dist = Math.abs(tree.x - worldX);
+            if (dist < 110) {
+              const proximity = Math.max(0, 1 - dist / 110);
+              if (tree.isScavenged) {
+                const clearedProg = tree.clearedProgress ?? 1.0;
+                const withering = Math.max(0, 1 - clearedProg);
+                const suppression = proximity * (1 - withering);
+                forestGrassFactor *= Math.max(0, 1 - suppression);
+              } else {
+                const treeBonus = proximity * 0.45;
+                if (treeBonus > forestGrassFactor) {
+                  forestGrassFactor = Math.min(1.0, forestGrassFactor + treeBonus);
+                }
+              }
+            }
+          }
+
+          if (forestGrassFactor <= 0.05) continue;
+
+          const sx = worldX - camX;
+          const windSway = Math.sin(this.animTimer * 1.5 + worldX * 0.02) * 3.2 + Math.sin(this.animTimer * 3.0 + worldX * 0.06) * 1.0;
+          const baseBladeH = (9 + (seed % 6) + (Math.sin(worldX * 0.07) * 3.5)) * forestGrassFactor * winterBladeScale;
+
+          ctx.moveTo(sx, gY);
+          ctx.quadraticCurveTo(sx + windSway * 0.4, gY - baseBladeH * 0.55, sx + windSway * forestGrassFactor, gY - baseBladeH);
+          hasBlades = true;
+        }
+
+        if (hasBlades) {
+          ctx.stroke();
         }
       }
+
+      // Direct zero-allocation root shadow blades pass
+      let hasRootBlades = false;
+      ctx.strokeStyle = grassBaseColors[0];
+      ctx.lineWidth = 1.2;
+      ctx.beginPath();
+      for (let worldX = startWx; worldX <= endWx; worldX += step) {
+        if (worldX < 285 || worldX > state.level.worldWidth - 285) continue;
+        let forestGrassFactor = 0;
+        if (worldX <= leftForestEdgeX && worldX >= 300) {
+          const edgeDist = leftForestEdgeX - worldX;
+          forestGrassFactor = Math.min(1.0, 0.55 + edgeDist / 70);
+        } else if (worldX >= rightForestEdgeX && worldX <= state.level.worldWidth - 300) {
+          const edgeDist = worldX - rightForestEdgeX;
+          forestGrassFactor = Math.min(1.0, 0.55 + edgeDist / 70);
+        }
+
+        for (let t = 0; t < visibleTreesCount; t++) {
+          const tree = this.cachedVisibleTrees[t];
+          const dist = Math.abs(tree.x - worldX);
+          if (dist < 110) {
+            const proximity = Math.max(0, 1 - dist / 110);
+            if (tree.isScavenged) {
+              const clearedProg = tree.clearedProgress ?? 1.0;
+              const withering = Math.max(0, 1 - clearedProg);
+              const suppression = proximity * (1 - withering);
+              forestGrassFactor *= Math.max(0, 1 - suppression);
+            } else {
+              const treeBonus = proximity * 0.45;
+              if (treeBonus > forestGrassFactor) {
+                forestGrassFactor = Math.min(1.0, forestGrassFactor + treeBonus);
+              }
+            }
+          }
+        }
+
+        if (forestGrassFactor <= 0.35) continue;
+
+        const sx = worldX - camX;
+        const seed = Math.abs(worldX);
+        const windSway = Math.sin(this.animTimer * 1.5 + worldX * 0.02) * 3.2 + Math.sin(this.animTimer * 3.0 + worldX * 0.06) * 1.0;
+        const baseBladeH = (9 + (seed % 6) + (Math.sin(worldX * 0.07) * 3.5)) * forestGrassFactor * winterBladeScale;
+
+        ctx.moveTo(sx - 2, gY);
+        ctx.quadraticCurveTo(sx - 3 + windSway * 0.25, gY - baseBladeH * 0.375, sx - 4 + windSway * 0.7, gY - baseBladeH * 0.75);
+        hasRootBlades = true;
+      }
+      if (hasRootBlades) {
+        ctx.stroke();
+      }
+
+      ctx.restore();
+    }
+
+    // Kış mevsiminde yerdeki çimen kaplamalarının üzerine dinamik olarak beyaz kar katmanları (piksel-art shader) ekle
+    if (this.winterProgress > 0.03) {
+      this.drawGrassSnowCaps(state, camX, slots, this.winterProgress);
     }
   }
 
-  // --- Foreground Grass Layer for Extra Depth ---
+  // --- Foreground Grass Layer for Extra Depth & Fixed Spring Flowers ---
 
-  private drawForegroundGrass(state: GameState, camX: number, slots: BuildSlot[] = []) {
+  private drawForegroundGrass(state: GameState, camX: number, _slots: BuildSlot[] = []) {
     const ctx = this.ctx;
     const gY = this.groundY;
-    if (state.season === 'winter') return;
+    if (this.winterProgress > 0.85) return; // Tam kışta karlar altında kalır
 
-    // Organic foreground tufts along the frontier to frame trenches & fortifications
-    const step = 22;
-    const startX = -(camX % step);
-    for (let sx = startX; sx < this.width + 10; sx += step) {
-      const worldX = sx + camX;
+    const isSummer = state.season === 'summer';
+    const isAutumn = state.season === 'autumn';
+    const isSpring = !isSummer && !isAutumn;
+
+    ctx.save();
+    if (this.winterProgress > 0) {
+      ctx.globalAlpha *= Math.max(0, 1.0 - this.winterProgress * 1.15);
+    }
+
+    const step = 28;
+    const startWx = Math.floor((camX - 30) / step) * step;
+    const endWx = Math.ceil((camX + this.width + 30) / step) * step;
+
+    ctx.strokeStyle = isSummer ? '#ca8a04' : (isAutumn ? '#b45309' : '#16a34a');
+    ctx.lineWidth = 1.3;
+    ctx.beginPath();
+    for (let worldX = startWx; worldX <= endWx; worldX += step) {
       if (worldX < 290 || worldX > state.level.worldWidth - 290) continue;
-
+      const sx = worldX - camX;
       const seed = Math.abs(worldX);
-      const sway = Math.sin(this.animTimer * 1.5 + worldX * 0.03) * 2.2;
-      const h = 6 + (seed % 5);
+      const sway = Math.sin(this.animTimer * 1.5 + worldX * 0.03) * 2.0;
+      const h = (5 + (seed % 4)) * (isSummer ? 0.75 : 1.0);
 
-      ctx.strokeStyle = (seed % 2 === 0) ? '#365314' : '#1e3a0f';
-      ctx.lineWidth = 1.4;
-      ctx.beginPath();
       ctx.moveTo(sx, gY + 1);
       ctx.quadraticCurveTo(sx + sway * 0.4, gY - h * 0.5, sx + sway, gY - h);
-      ctx.stroke();
+    }
+    ctx.stroke();
 
-      if (seed % 3 === 0) {
-        ctx.strokeStyle = '#4d7c0f';
+    // İlkbaharda Çanakkale Gelincikleri (Kırmızı Çiçekler) ve Beyaz Papatyalar
+    // Sabit dünya koordinatlarına kilitli adım (yürürken/koşarken asla sıçramaz veya yer değiştirmez)
+    if (isSpring) {
+      const flowerStep = 56;
+      const fStartWx = Math.floor((camX - 30) / flowerStep) * flowerStep;
+      const fEndWx = Math.ceil((camX + this.width + 30) / flowerStep) * flowerStep;
+
+      for (let worldX = fStartWx; worldX <= fEndWx; worldX += flowerStep) {
+        if (worldX < 310 || worldX > state.level.worldWidth - 310) continue;
+        const seed = Math.abs(worldX);
+        const sx = worldX - camX;
+        const sway = Math.sin(this.animTimer * 1.8 + worldX * 0.04) * 2.2;
+        const stemH = 10 + (seed % 6);
+
+        // Narin yeşil sap
+        ctx.strokeStyle = '#15803d';
         ctx.lineWidth = 1.0;
         ctx.beginPath();
-        ctx.moveTo(sx + 2, gY + 1);
-        ctx.quadraticCurveTo(sx + 2 + sway * 0.3, gY - h * 0.4, sx + 3 + sway * 0.8, gY - h * 0.7);
+        ctx.moveTo(sx, gY);
+        ctx.quadraticCurveTo(sx + sway * 0.4, gY - stemH * 0.6, sx + sway, gY - stemH);
         ctx.stroke();
+
+        const flowerX = sx + sway;
+        const flowerY = gY - stemH;
+
+        if (seed % 3 === 0) {
+          // İkonik Gelibolu Kırmızı Gelinciği
+          ctx.fillStyle = '#dc2626';
+          ctx.beginPath();
+          ctx.arc(flowerX, flowerY, 3.2, 0, Math.PI * 2);
+          ctx.fill();
+          // Koyu tohum göbeği
+          ctx.fillStyle = '#1c1917';
+          ctx.fillRect(flowerX - 0.8, flowerY - 0.8, 1.6, 1.6);
+        } else if (seed % 3 === 1) {
+          // Kır Papatyası
+          ctx.fillStyle = '#f8fafc';
+          ctx.beginPath();
+          ctx.arc(flowerX, flowerY, 2.5, 0, Math.PI * 2);
+          ctx.fill();
+          // Sarı papatya gözü
+          ctx.fillStyle = '#facc15';
+          ctx.fillRect(flowerX - 0.6, flowerY - 0.6, 1.2, 1.2);
+        }
       }
     }
+
+    ctx.restore();
+  }
+
+  // --- Dynamic Pixel-Art Snow Caps Atop Grass Clumps (Çimen Üzeri Kar Katmanı Shader) ---
+
+  private drawGrassSnowCaps(state: GameState, camX: number, slots: BuildSlot[] = [], progress: number) {
+    if (progress <= 0.02) return;
+    const ctx = this.ctx;
+    const gY = this.groundY;
+
+    // Zero-allocation tree proximity filtering using pre-allocated cache
+    this.cachedVisibleTrees.length = 0;
+    let leftForestEdgeX = -9999;
+    let rightForestEdgeX = 999999;
+    if (slots) {
+      for (let i = 0; i < slots.length; i++) {
+        const s = slots[i];
+        if (s.type === 'scavenge_wood') {
+          if (!s.isScavenged) {
+            if (s.side === 'left' && s.x + 60 > leftForestEdgeX) leftForestEdgeX = s.x + 60;
+            if (s.side === 'right' && s.x - 60 < rightForestEdgeX) rightForestEdgeX = s.x - 60;
+          }
+          if (s.x >= camX - 120 && s.x <= camX + this.width + 120) {
+            this.cachedVisibleTrees.push(s);
+          }
+        }
+      }
+    }
+
+    const step = 20;
+    const startWx = Math.floor((camX - 30) / step) * step;
+    const endWx = Math.ceil((camX + this.width + 30) / step) * step;
+    const visibleTreesCount = this.cachedVisibleTrees.length;
+
+    ctx.save();
+
+    for (let worldX = startWx; worldX <= endWx; worldX += step) {
+      if (worldX < 280 || worldX > state.level.worldWidth - 280) continue;
+
+      let factor = 0.55;
+      if (worldX <= leftForestEdgeX && worldX >= 300) {
+        const edgeDist = leftForestEdgeX - worldX;
+        factor = Math.min(1.0, 0.7 + edgeDist / 70);
+      } else if (worldX >= rightForestEdgeX && worldX <= state.level.worldWidth - 300) {
+        const edgeDist = worldX - rightForestEdgeX;
+        factor = Math.min(1.0, 0.7 + edgeDist / 70);
+      }
+
+      for (let t = 0; t < visibleTreesCount; t++) {
+        const tree = this.cachedVisibleTrees[t];
+        const dist = Math.abs(tree.x - worldX);
+        if (dist < 110) {
+          factor = Math.min(1.0, factor + Math.max(0, 1 - dist / 110) * 0.45);
+        }
+      }
+
+      const seed = Math.abs(worldX);
+      const sx = worldX - camX;
+
+      // Snow cluster dimensions growing dynamically with progress
+      const moundW = (8 + (seed % 6) + progress * 10) * factor;
+      const moundH = (2.5 + (seed % 3) + progress * 5.5) * factor;
+      const moundBaseY = gY - (progress > 0.45 ? 1 : 3);
+
+      // 1. Shaded underside resting on soil/grass
+      ctx.fillStyle = `rgba(203, 213, 225, ${(progress * 0.85).toFixed(3)})`;
+      ctx.beginPath();
+      ctx.ellipse(sx, moundBaseY, moundW * 0.5 + 1, moundH * 0.5 + 1, 0, 0, Math.PI * 2);
+      ctx.fill();
+
+      // 2. Pillowy snow body
+      ctx.fillStyle = `rgba(241, 245, 249, ${(progress * 0.95).toFixed(3)})`;
+      ctx.beginPath();
+      ctx.ellipse(sx, moundBaseY - 1, moundW * 0.45, moundH * 0.45, 0, 0, Math.PI * 2);
+      ctx.fill();
+
+      // 3. Crisp white snow crest
+      ctx.fillStyle = `rgba(255, 255, 255, ${(progress * 0.98).toFixed(3)})`;
+      ctx.beginPath();
+      ctx.ellipse(sx, moundBaseY - 2, moundW * 0.35, moundH * 0.3, 0, 0, Math.PI * 2);
+      ctx.fill();
+
+      // 4. Pixel-art snow clumps on upper grass tips
+      if (progress < 0.80) {
+        const tipSway = Math.sin(this.animTimer * 1.5 + worldX * 0.02) * 2.0;
+        const tipX = sx + tipSway;
+        const tipY = gY - (8 + (seed % 5)) * (1.0 - progress * 0.4);
+        ctx.fillStyle = `rgba(255, 255, 255, ${(progress * 0.90).toFixed(3)})`;
+        ctx.fillRect(tipX - 1.5, tipY, 3, 2);
+        ctx.fillStyle = `rgba(203, 213, 225, ${(progress * 0.70).toFixed(3)})`;
+        ctx.fillRect(tipX - 1, tipY + 1.5, 2, 1);
+      }
+    }
+
+    ctx.restore();
+  }
+
+  // --- Dynamic Snow Footprints Simulation (Kar Üzerinde Ayak & Nal İzleri) ---
+
+  private updateFootprints(dt: number, state: GameState, commander: PlayerCommander, soldiers: Soldier[] = []) {
+    // Only update and keep footprints when there is snow accumulation on the ground
+    if (this.winterProgress <= 0.04) {
+      if (this.snowFootprints.length > 0) this.snowFootprints.length = 0;
+      return;
+    }
+
+    const gY = this.groundY;
+    const isMoving = commander.state === 'walking' || commander.state === 'galloping';
+
+    // 1. Commander & Mount Hoofprints
+    if (isMoving) {
+      const dist = Math.abs(commander.x - this.lastCmdFootprintX);
+      const strideDist = commander.isSprinting ? 22 : 14;
+
+      if (dist >= strideDist) {
+        this.lastCmdFootprintX = commander.x;
+        this.cmdFootprintSide = (this.cmdFootprintSide === 1 ? -1 : 1);
+
+        // Front & Rear alternating hoof impressions
+        const hoofOffset = commander.facing * (commander.isSprinting ? 16 : 10);
+        this.snowFootprints.push({
+          x: commander.x - hoofOffset,
+          y: gY + 1,
+          facing: commander.facing,
+          type: 'hoof',
+          alpha: 1.0,
+          depth: this.winterProgress,
+          age: 0,
+          side: this.cmdFootprintSide
+        });
+
+        // Galloping creates dual staggered hoof strikes
+        if (commander.isSprinting) {
+          this.snowFootprints.push({
+            x: commander.x - hoofOffset - commander.facing * 8,
+            y: gY + 1.5,
+            facing: commander.facing,
+            type: 'hoof',
+            alpha: 0.9,
+            depth: this.winterProgress * 0.85,
+            age: 0,
+            side: (this.cmdFootprintSide * -1) as (-1 | 1)
+          });
+        }
+      }
+    }
+
+    // 2. Marching Soldiers Footprints
+    if (soldiers && soldiers.length > 0) {
+      const visibleRange = 700;
+      const minX = commander.x - visibleRange;
+      const maxX = commander.x + visibleRange;
+
+      for (let i = 0; i < soldiers.length; i++) {
+        const sol = soldiers[i];
+        if ((sol.state === 'walking' || sol.state === 'running') && sol.x >= minX && sol.x <= maxX) {
+          if (Math.random() < 0.08) {
+            this.snowFootprints.push({
+              x: sol.x - (sol.facing || 1) * 3,
+              y: gY + 1.5,
+              facing: sol.facing || 1,
+              type: 'boot',
+              alpha: 0.85,
+              depth: this.winterProgress * 0.8,
+              age: 0,
+              side: 1
+            });
+          }
+        }
+      }
+    }
+
+    // 3. Age & Fade Footprints over time (Snowfall fills them faster!)
+    const isSnowing = state.weather === 'snow' || state.weather === 'storm';
+    const fadeRate = isSnowing ? 0.09 : 0.045; // ~11s during snowfall, ~22s in clear winter
+
+    for (let i = this.snowFootprints.length - 1; i >= 0; i--) {
+      const fp = this.snowFootprints[i];
+      fp.age += dt;
+      fp.alpha = Math.max(0, 1.0 - fp.age * fadeRate);
+      if (fp.alpha <= 0.02) {
+        this.snowFootprints.splice(i, 1);
+      }
+    }
+
+    // Cap footprint count to protect rendering budget
+    if (this.snowFootprints.length > 120) {
+      this.snowFootprints.splice(0, this.snowFootprints.length - 120);
+    }
+  }
+
+  private drawFootprints(camX: number, state: GameState) {
+    if (this.winterProgress <= 0.04 || this.snowFootprints.length === 0) return;
+    const ctx = this.ctx;
+
+    ctx.save();
+    for (let i = 0; i < this.snowFootprints.length; i++) {
+      const fp = this.snowFootprints[i];
+      const sx = fp.x - camX;
+      if (sx < -30 || sx > this.width + 30) continue;
+
+      const alpha = fp.alpha * Math.min(1.0, this.winterProgress * 1.2);
+      if (alpha <= 0.03) continue;
+
+      const sy = fp.y;
+      const sideOffset = fp.side * 2.0;
+
+      if (fp.type === 'hoof') {
+        // Pixel-art indented horseshoe mark stamped into deep snow
+        // 1. Shadowed indentation
+        ctx.fillStyle = `rgba(100, 116, 139, ${(alpha * 0.75).toFixed(3)})`;
+        ctx.beginPath();
+        ctx.ellipse(sx, sy + sideOffset, 3.8, 2.2, 0, 0, Math.PI * 2);
+        ctx.fill();
+
+        // 2. Dark compressed snow center
+        ctx.fillStyle = `rgba(51, 65, 85, ${(alpha * 0.85).toFixed(3)})`;
+        ctx.beginPath();
+        ctx.arc(sx, sy + sideOffset, 1.8, 0, Math.PI * 2);
+        ctx.fill();
+
+        // 3. Displaced white powdery snow lip around rim
+        ctx.fillStyle = `rgba(255, 255, 255, ${(alpha * 0.90).toFixed(3)})`;
+        ctx.fillRect(sx - 3.8, sy + sideOffset - 1.2, 1.2, 2.4);
+        ctx.fillRect(sx + 2.6, sy + sideOffset - 1.2, 1.2, 2.4);
+        ctx.fillRect(sx - 2, sy + sideOffset - 2.5, 4, 1.2);
+      } else {
+        // Soldier boot imprint
+        ctx.fillStyle = `rgba(100, 116, 139, ${(alpha * 0.65).toFixed(3)})`;
+        ctx.fillRect(sx - 1.5, sy + sideOffset - 1, 3.2, 2.0);
+        ctx.fillStyle = `rgba(51, 65, 85, ${(alpha * 0.80).toFixed(3)})`;
+        ctx.fillRect(sx - 1.0, sy + sideOffset - 0.5, 2.0, 1.2);
+        // White snow rim
+        ctx.fillStyle = `rgba(255, 255, 255, ${(alpha * 0.85).toFixed(3)})`;
+        ctx.fillRect(sx - 2.2, sy + sideOffset - 0.8, 0.8, 1.6);
+        ctx.fillRect(sx + 1.8, sy + sideOffset - 0.8, 0.8, 1.6);
+      }
+    }
+    ctx.restore();
   }
 
   // --- Dynamic Forest Backdrop (Kingdom Two Crowns Wilderness & Clearing Engine) ---
@@ -1193,12 +1915,16 @@ export class GameRenderer {
     const gY = this.groundY;
     const isNight = state.dayProgress > 0.55;
 
-    // Find active uncut trees on both flanks
-    const leftStandingTrees = slots.filter((s) => s.type === 'scavenge_wood' && s.side === 'left' && !s.isScavenged);
-    const rightStandingTrees = slots.filter((s) => s.type === 'scavenge_wood' && s.side === 'right' && !s.isScavenged);
-
-    const leftForestEdgeX = leftStandingTrees.length > 0 ? Math.max(...leftStandingTrees.map((t) => t.x)) + 30 : -9999;
-    const rightForestEdgeX = rightStandingTrees.length > 0 ? Math.min(...rightStandingTrees.map((t) => t.x)) - 30 : 999999;
+    // Single pass edge computation with 0 array allocations
+    let leftForestEdgeX = -9999;
+    let rightForestEdgeX = 999999;
+    for (let i = 0; i < slots.length; i++) {
+      const s = slots[i];
+      if (s.type === 'scavenge_wood' && !s.isScavenged) {
+        if (s.side === 'left' && s.x + 30 > leftForestEdgeX) leftForestEdgeX = s.x + 30;
+        if (s.side === 'right' && s.x - 30 < rightForestEdgeX) rightForestEdgeX = s.x - 30;
+      }
+    }
 
     ctx.save();
 
@@ -1207,67 +1933,58 @@ export class GameRenderer {
       const edgeScreenX = leftForestEdgeX - camX;
       if (edgeScreenX > -200) {
         const startScreenX = Math.max(-200, 0 - camX);
-        const forestW = Math.max(0, edgeScreenX - startScreenX);
 
-        if (forestW > 0) {
-          // Forest background canopy silhouette - smoothly tapers down to ground line
-          const canopyGrad = ctx.createLinearGradient(0, gY - 260, 0, gY);
-          canopyGrad.addColorStop(0, isNight ? '#050c05' : '#0f2411');
-          canopyGrad.addColorStop(0.7, isNight ? '#081408' : '#143818');
-          canopyGrad.addColorStop(1, isNight ? '#0a1a0c' : '#1b4a20');
+        // Soft atmospheric pine forest gradient blending gently towards the sky
+        const canopyGrad = ctx.createLinearGradient(0, gY - 220, 0, gY);
+        canopyGrad.addColorStop(0, isNight ? 'rgba(5, 14, 7, 0.70)' : 'rgba(18, 48, 22, 0.82)');
+        canopyGrad.addColorStop(0.22, isNight ? '#07180a' : '#143d1a');
+        canopyGrad.addColorStop(0.65, isNight ? '#091c0d' : '#1a4e23');
+        canopyGrad.addColorStop(1, isNight ? '#0c2210' : '#225d2b');
 
+        const startWx = Math.max(0, Math.floor((camX - 120) / 25) * 25);
+        const endWx = Math.min(leftForestEdgeX, Math.ceil((camX + this.width + 120) / 25) * 25);
+        if (startWx < endWx) {
           ctx.fillStyle = canopyGrad;
           ctx.beginPath();
-          ctx.moveTo(startScreenX, gY);
-          for (let wx = 0; wx <= leftForestEdgeX; wx += 35) {
+          ctx.moveTo(startWx - camX, gY);
+          for (let wx = startWx; wx <= endWx; wx += 25) {
             const sx = wx - camX;
-            const distToEdge = leftForestEdgeX - wx;
-            const taper = distToEdge < 280 ? Math.sin(Math.max(0, distToEdge / 280) * (Math.PI / 2)) : 1;
-            const treeHeight = (160 + (Math.sin(wx * 0.05) * 35) + (Math.cos(wx * 0.02) * 20)) * taper;
+            const distToEdge = Math.max(0, leftForestEdgeX - wx);
+            // Smooth Hermite S-curve taper (3t^2 - 2t^3) over 320px for organic clearing transition
+            const normDist = Math.min(1, Math.max(0, distToEdge / 320));
+            const taper = normDist * normDist * (3 - 2 * normDist);
+            const pineCrown = Math.sin(wx * 0.038) * 22 + Math.sin(wx * 0.09) * 12 + Math.cos(wx * 0.18) * 6;
+            const treeHeight = (155 + pineCrown) * taper;
             ctx.lineTo(sx, gY - treeHeight);
           }
-          ctx.lineTo(edgeScreenX, gY);
-          ctx.closePath();
-          ctx.fill();
-
-          // Dense timber trunks & layered foliage, fading naturally toward the edge
-          for (let wx = 50; wx <= leftForestEdgeX - 10; wx += 60) {
-            const sx = wx - camX;
-            if (sx < -80 || sx > this.width + 80) continue;
-            const distToEdge = leftForestEdgeX - wx;
-            const scale = distToEdge < 240 ? Math.max(0.2, distToEdge / 240) : 1;
-            const alpha = distToEdge < 220 ? Math.max(0.05, distToEdge / 220) : 1;
-            this.drawBackgroundPineTree(sx, gY, wx, isNight, scale, alpha);
-          }
-
-          // Ground Level Forest Atmosphere Mist (Only near ground turf, NO full-height vertical sky seams)
-          const mistGrad = ctx.createLinearGradient(0, gY - 70, 0, gY);
-          mistGrad.addColorStop(0, 'rgba(0, 0, 0, 0)');
-          mistGrad.addColorStop(1, isNight ? 'rgba(5, 15, 7, 0.45)' : 'rgba(15, 38, 18, 0.30)');
-          ctx.fillStyle = mistGrad;
-          ctx.beginPath();
-          ctx.moveTo(startScreenX, gY);
-          ctx.lineTo(startScreenX, gY - 60);
-          ctx.lineTo(edgeScreenX, gY - 10);
-          ctx.lineTo(edgeScreenX, gY);
-          ctx.closePath();
-          ctx.fill();
-
-          // Top Screen Forest Canopy Overhang with smooth tapered natural edge (tapering height to 0)
-          ctx.fillStyle = isNight ? '#030804' : '#0a1d0d';
-          ctx.beginPath();
-          ctx.moveTo(startScreenX, 0);
-          for (let wx = 0; wx <= leftForestEdgeX; wx += 25) {
-            const sx = wx - camX;
-            const distToEdge = leftForestEdgeX - wx;
-            const taper = distToEdge < 220 ? Math.sin(Math.max(0, distToEdge / 220) * (Math.PI / 2)) : 1;
-            const branchH = (45 + Math.sin(wx * 0.08) * 18 + Math.cos(wx * 0.03) * 12) * taper;
-            ctx.lineTo(sx, branchH);
-          }
-          ctx.lineTo(edgeScreenX, 0);
+          ctx.lineTo(endWx - camX, gY);
           ctx.closePath();
           ctx.fill();
         }
+
+        // Dense timber trunks (blitted from static sprite cache for 0 frame overhead)
+        const startTrunk = Math.max(50, Math.floor((camX - 100) / 60) * 60);
+        const endTrunk = Math.min(leftForestEdgeX - 15, Math.ceil((camX + this.width + 100) / 60) * 60);
+        for (let wx = startTrunk; wx <= endTrunk; wx += 60) {
+          const sx = wx - camX;
+          const distToEdge = Math.max(0, leftForestEdgeX - wx);
+          const scale = distToEdge < 280 ? Math.max(0.3, distToEdge / 280) : 1;
+          const alpha = distToEdge < 240 ? Math.max(0.08, distToEdge / 240) : 1;
+          this.drawBackgroundPineTree(sx, gY, wx, isNight, scale, alpha);
+        }
+
+        // Ground Level Forest Atmosphere Mist
+        const mistGrad = ctx.createLinearGradient(0, gY - 70, 0, gY);
+        mistGrad.addColorStop(0, 'rgba(0, 0, 0, 0)');
+        mistGrad.addColorStop(1, isNight ? 'rgba(5, 15, 7, 0.40)' : 'rgba(15, 38, 18, 0.25)');
+        ctx.fillStyle = mistGrad;
+        ctx.beginPath();
+        ctx.moveTo(startScreenX, gY);
+        ctx.lineTo(startScreenX, gY - 60);
+        ctx.lineTo(edgeScreenX, gY - 10);
+        ctx.lineTo(edgeScreenX, gY);
+        ctx.closePath();
+        ctx.fill();
       }
     }
 
@@ -1278,61 +1995,55 @@ export class GameRenderer {
       const endScreenX = worldEnd - camX;
 
       if (edgeScreenX < this.width + 200) {
-        // Forest background canopy silhouette - smoothly tapers up from ground line
-        const canopyGrad = ctx.createLinearGradient(0, gY - 260, 0, gY);
-        canopyGrad.addColorStop(0, isNight ? '#050c05' : '#0f2411');
-        canopyGrad.addColorStop(0.7, isNight ? '#081408' : '#143818');
-        canopyGrad.addColorStop(1, isNight ? '#0a1a0c' : '#1b4a20');
+        // Soft atmospheric pine forest gradient blending gently towards the sky
+        const canopyGrad = ctx.createLinearGradient(0, gY - 220, 0, gY);
+        canopyGrad.addColorStop(0, isNight ? 'rgba(5, 14, 7, 0.70)' : 'rgba(18, 48, 22, 0.82)');
+        canopyGrad.addColorStop(0.22, isNight ? '#07180a' : '#143d1a');
+        canopyGrad.addColorStop(0.65, isNight ? '#091c0d' : '#1a4e23');
+        canopyGrad.addColorStop(1, isNight ? '#0c2210' : '#225d2b');
 
-        ctx.fillStyle = canopyGrad;
-        ctx.beginPath();
-        ctx.moveTo(edgeScreenX, gY);
-        for (let wx = rightForestEdgeX; wx <= worldEnd; wx += 35) {
-          const sx = wx - camX;
-          const distFromEdge = wx - rightForestEdgeX;
-          const taper = distFromEdge < 280 ? Math.sin(Math.max(0, distFromEdge / 280) * (Math.PI / 2)) : 1;
-          const treeHeight = (160 + (Math.sin(wx * 0.05) * 35) + (Math.cos(wx * 0.02) * 20)) * taper;
-          ctx.lineTo(sx, gY - treeHeight);
+        const startWxR = Math.max(rightForestEdgeX, Math.floor((camX - 120) / 25) * 25);
+        const endWxR = Math.min(worldEnd, Math.ceil((camX + this.width + 120) / 25) * 25);
+        if (startWxR < endWxR) {
+          ctx.fillStyle = canopyGrad;
+          ctx.beginPath();
+          ctx.moveTo(startWxR - camX, gY);
+          for (let wx = startWxR; wx <= endWxR; wx += 25) {
+            const sx = wx - camX;
+            const distFromEdge = Math.max(0, wx - rightForestEdgeX);
+            // Smooth Hermite S-curve taper (3t^2 - 2t^3) over 320px for organic clearing transition
+            const normDist = Math.min(1, Math.max(0, distFromEdge / 320));
+            const taper = normDist * normDist * (3 - 2 * normDist);
+            const pineCrown = Math.sin(wx * 0.038) * 22 + Math.sin(wx * 0.09) * 12 + Math.cos(wx * 0.18) * 6;
+            const treeHeight = (155 + pineCrown) * taper;
+            ctx.lineTo(sx, gY - treeHeight);
+          }
+          ctx.lineTo(endWxR - camX, gY);
+          ctx.closePath();
+          ctx.fill();
         }
-        ctx.lineTo(endScreenX, gY);
-        ctx.closePath();
-        ctx.fill();
 
-        // Dense timber trunks & layered foliage, fading naturally toward the clearing
-        for (let wx = rightForestEdgeX + 10; wx <= worldEnd - 50; wx += 60) {
+        // Dense timber trunks & layered foliage
+        const startTrunkR = Math.max(rightForestEdgeX + 15, Math.floor((camX - 100) / 60) * 60);
+        const endTrunkR = Math.min(worldEnd - 50, Math.ceil((camX + this.width + 100) / 60) * 60);
+        for (let wx = startTrunkR; wx <= endTrunkR; wx += 60) {
           const sx = wx - camX;
-          if (sx < -80 || sx > this.width + 80) continue;
-          const distFromEdge = wx - rightForestEdgeX;
-          const scale = distFromEdge < 240 ? Math.max(0.2, distFromEdge / 240) : 1;
-          const alpha = distFromEdge < 220 ? Math.max(0.05, distFromEdge / 220) : 1;
+          const distFromEdge = Math.max(0, wx - rightForestEdgeX);
+          const scale = distFromEdge < 280 ? Math.max(0.3, distFromEdge / 280) : 1;
+          const alpha = distFromEdge < 240 ? Math.max(0.08, distFromEdge / 240) : 1;
           this.drawBackgroundPineTree(sx, gY, wx, isNight, scale, alpha);
         }
 
-        // Ground Level Forest Atmosphere Mist (Only near ground turf, NO full-height vertical sky seams)
+        // Ground Level Forest Atmosphere Mist
         const mistGrad = ctx.createLinearGradient(0, gY - 70, 0, gY);
         mistGrad.addColorStop(0, 'rgba(0, 0, 0, 0)');
-        mistGrad.addColorStop(1, isNight ? 'rgba(5, 15, 7, 0.45)' : 'rgba(15, 38, 18, 0.30)');
+        mistGrad.addColorStop(1, isNight ? 'rgba(5, 15, 7, 0.40)' : 'rgba(15, 38, 18, 0.25)');
         ctx.fillStyle = mistGrad;
         ctx.beginPath();
         ctx.moveTo(edgeScreenX, gY);
         ctx.lineTo(edgeScreenX, gY - 10);
         ctx.lineTo(endScreenX, gY - 60);
         ctx.lineTo(endScreenX, gY);
-        ctx.closePath();
-        ctx.fill();
-
-        // Top Screen Forest Canopy Overhang with smooth tapered natural edge (tapering height from 0)
-        ctx.fillStyle = isNight ? '#030804' : '#0a1d0d';
-        ctx.beginPath();
-        ctx.moveTo(edgeScreenX, 0);
-        for (let wx = rightForestEdgeX; wx <= worldEnd; wx += 25) {
-          const sx = wx - camX;
-          const distFromEdge = wx - rightForestEdgeX;
-          const taper = distFromEdge < 220 ? Math.sin(Math.max(0, distFromEdge / 220) * (Math.PI / 2)) : 1;
-          const branchH = (45 + Math.sin(wx * 0.08) * 18 + Math.cos(wx * 0.03) * 12) * taper;
-          ctx.lineTo(sx, branchH);
-        }
-        ctx.lineTo(endScreenX, 0);
         ctx.closePath();
         ctx.fill();
       }
@@ -1344,6 +2055,29 @@ export class GameRenderer {
   private drawBackgroundPineTree(x: number, y: number, seed: number, isNight: boolean, scale = 1, alpha = 1) {
     if (alpha <= 0.02 || scale <= 0.05) return;
     const ctx = this.ctx;
+
+    // Fast Offscreen Texture Cache Lookup (Single drawImage blit for zero CPU path overhead)
+    let quantScale = '100';
+    if (scale <= 0.4) quantScale = '35';
+    else if (scale <= 0.6) quantScale = '50';
+    else if (scale <= 0.85) quantScale = '75';
+
+    const cacheKey = `pine_${isNight ? 'night' : 'day'}_${quantScale}`;
+    const cachedCanvas = this.staticSpriteCache.get(cacheKey);
+
+    if (cachedCanvas) {
+      if (alpha < 0.98) {
+        ctx.save();
+        ctx.globalAlpha *= alpha;
+        ctx.drawImage(cachedCanvas, x - cachedCanvas.width / 2, y - cachedCanvas.height);
+        ctx.restore();
+      } else {
+        ctx.drawImage(cachedCanvas, x - cachedCanvas.width / 2, y - cachedCanvas.height);
+      }
+      return;
+    }
+
+    // Direct fallback if cache key not yet created
     ctx.save();
     if (alpha < 1) ctx.globalAlpha *= alpha;
     const trunkH = (110 + (seed % 40)) * scale;
@@ -1878,33 +2612,30 @@ export class GameRenderer {
     const ctx = this.ctx;
     const gY = this.groundY;
 
-    // Determine current Headquarters Level (1 = Odun/Ahşap, 2 = Gelişmiş Odun/Kütük, 3 = Kesme Taş Tabya)
-    const hqSlot = slots.find((s) => s.id === 'hq_main');
-    const hqTier = hqSlot ? hqSlot.level : 1;
+    // Fast single pass for HQ Tier & Frontier flags (0 array allocations)
+    let hqTier = 1;
+    let leftFrontier: BuildSlot | null = null;
+    let rightFrontier: BuildSlot | null = null;
+    for (let i = 0; i < slots.length; i++) {
+      const s = slots[i];
+      if (s.id === 'hq_main') {
+        hqTier = s.level;
+      }
+      if ((s.type === 'trench' || s.type === 'barbed_wire') && s.level > 0 && !s.underConstruction) {
+        if (s.side === 'left') {
+          if (!leftFrontier || s.x < leftFrontier.x) leftFrontier = s;
+        } else if (s.side === 'right') {
+          if (!rightFrontier || s.x > rightFrontier.x) rightFrontier = s;
+        }
+      }
+    }
 
-    // Frontier boundary detection for Kingdom-style defense flags (Düşmana en yakın siper veya tel)
-    const leftDefs = slots.filter((s) => s.side === 'left' && (s.type === 'trench' || s.type === 'barbed_wire') && s.level > 0 && !s.underConstruction);
-    const rightDefs = slots.filter((s) => s.side === 'right' && (s.type === 'trench' || s.type === 'barbed_wire') && s.level > 0 && !s.underConstruction);
-    const leftFrontier = leftDefs.length > 0 ? leftDefs.reduce((min, s) => s.x < min.x ? s : min, leftDefs[0]) : null;
-    const rightFrontier = rightDefs.length > 0 ? rightDefs.reduce((max, s) => s.x > max.x ? s : max, rightDefs[0]) : null;
-
-    for (const slot of slots) {
+    for (let i = 0; i < slots.length; i++) {
+      const slot = slots[i];
       const sx = slot.x - camX;
       if (sx < -150 || sx > this.width + 150) continue;
 
-      const isFocused = activeSlot && activeSlot.id === slot.id;
-
-      // Slot Highlight Aura when commander is close
-      if (isFocused) {
-        ctx.save();
-        ctx.strokeStyle = '#f59e0b';
-        ctx.lineWidth = 2.5;
-        ctx.setLineDash([5, 3]);
-        ctx.beginPath();
-        ctx.arc(sx, gY - 22, 40, 0, Math.PI * 2);
-        ctx.stroke();
-        ctx.restore();
-      }
+      const isFocused = activeSlot !== null && activeSlot.id === slot.id;
 
       switch (slot.type) {
         case 'headquarters':
@@ -2524,6 +3255,90 @@ export class GameRenderer {
     const wave = Math.sin(this.animTimer * 3.2 + (slot.side === 'left' ? 0.5 : 1.5)) * 2.5;
     const isLeft = slot.side === 'left';
     const flagDir = isLeft ? -1 : 1;
+
+    // Wooden Armor Stand Rack (Taarruz Zırhı Sehpası - Cephanelikteki gibi zırhların dizildiği sehpa)
+    const armorsAvailable = Math.min(4, Math.max(0, slot.availableAssaultArmors || 0));
+    const rackBaseX = x + 24 * flagDir;
+
+    // Wooden timber base sill & shadow
+    ctx.fillStyle = 'rgba(0,0,0,0.35)';
+    ctx.beginPath();
+    ctx.ellipse(rackBaseX, y - 2, 28, 4, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.fillStyle = '#291305';
+    ctx.fillRect(rackBaseX - 24, y - 4, 48, 4);
+    ctx.fillStyle = '#451a03';
+    ctx.fillRect(rackBaseX - 23, y - 4, 46, 2);
+
+    // Left & right support timber posts
+    ctx.fillStyle = '#451a03';
+    ctx.fillRect(rackBaseX - 22, y - 28, 3.5, 24);
+    ctx.fillRect(rackBaseX + 18.5, y - 28, 3.5, 24);
+    // Polished brass corner braces
+    ctx.fillStyle = '#f59e0b';
+    ctx.fillRect(rackBaseX - 23, y - 29, 3, 4);
+    ctx.fillRect(rackBaseX + 20, y - 29, 3, 4);
+
+    // Horizontal crossbeam rail
+    ctx.fillStyle = '#5c2b09';
+    ctx.fillRect(rackBaseX - 23, y - 26, 46, 3);
+    ctx.fillStyle = '#78350f';
+    ctx.fillRect(rackBaseX - 22, y - 13, 44, 2);
+
+    // 4 Armor bay rest positions
+    for (let i = 0; i < 4; i++) {
+      const pegX = rackBaseX - 16 + i * 11;
+
+      // Wooden peg hook
+      ctx.fillStyle = '#3a1e05';
+      ctx.fillRect(pegX - 1, y - 28, 2, 4);
+
+      if (i < armorsAvailable) {
+        // Armored WWI Sappenpanzer Cuirass & Steel Helmet hung on this bay!
+        // Steel helmet with browplate on peg
+        ctx.fillStyle = '#1e293b';
+        ctx.beginPath();
+        ctx.ellipse(pegX, y - 27, 4.5, 3, 0, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillStyle = '#475569';
+        ctx.fillRect(pegX - 4, y - 28, 8, 1.2);
+
+        // Segmented steel breastplate
+        ctx.fillStyle = '#334155';
+        ctx.fillRect(pegX - 4.5, y - 23, 9, 8);
+        ctx.fillStyle = '#64748b';
+        ctx.fillRect(pegX - 3.5, y - 22.5, 7, 1.5);
+
+        // Brass rivets
+        ctx.fillStyle = '#f59e0b';
+        ctx.fillRect(pegX - 3.5, y - 19, 1.2, 1.2);
+        ctx.fillRect(pegX + 2.3, y - 19, 1.2, 1.2);
+
+        // Lower abdominal segmented plates
+        ctx.fillStyle = '#1e293b';
+        ctx.fillRect(pegX - 4, y - 14, 8, 3.5);
+        ctx.fillStyle = '#334155';
+        ctx.fillRect(pegX - 3.5, y - 10, 7, 3);
+        ctx.fillStyle = '#64748b';
+        ctx.fillRect(pegX - 2.5, y - 9.5, 5, 1);
+      } else {
+        // Empty wooden coat hanger silhouette
+        ctx.strokeStyle = 'rgba(120, 53, 15, 0.45)';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(pegX - 4, y - 22);
+        ctx.lineTo(pegX, y - 25);
+        ctx.lineTo(pegX + 4, y - 22);
+        ctx.stroke();
+      }
+    }
+
+    // Ready Armor Badge / Counter
+    ctx.fillStyle = armorsAvailable > 0 ? '#4ade80' : '#a8a29e';
+    ctx.font = 'bold 8.5px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText(`🛡️ ZIRH: ${armorsAvailable}/4`, rackBaseX, y - 32);
 
     ctx.fillStyle = '#b91c1c';
     ctx.beginPath();
@@ -3170,115 +3985,34 @@ export class GameRenderer {
 
     if (slot.level === 0) {
       // Unbuilt Plot: Authentic Gallipoli Trench Excavation Plot
-      ctx.fillStyle = '#261406';
-      ctx.beginPath();
-      ctx.ellipse(x, y - 2, 46, 8, 0, 0, Math.PI * 2);
-      ctx.fill();
-
-      // Dug trench ditch shadow
-      ctx.fillStyle = '#140a03';
-      ctx.fillRect(x - 36, y - 5, 72, 6);
-
-      // Wooden trench revetment stakes
-      ctx.fillStyle = hqTier === 3 ? '#334155' : (hqTier === 2 ? '#78350f' : '#854d0e');
-      ctx.fillRect(x - 32, y - 22, 3.5, 22);
-      ctx.fillRect(x - 12, y - 18, 3, 18);
-      ctx.fillRect(x + 12, y - 18, 3, 18);
-      ctx.fillRect(x + 30, y - 22, 3.5, 22);
-
-      // Surveyor twine marking trench alignment
-      ctx.strokeStyle = '#fde047';
-      ctx.lineWidth = 1.2;
-      ctx.beginPath();
-      ctx.moveTo(x - 32, y - 15);
-      ctx.lineTo(x + 30, y - 15);
-      ctx.stroke();
-
-      // Steel Shovel stuck in fresh dirt heap
-      ctx.fillStyle = '#64748b';
-      ctx.fillRect(x - 14, y - 24, 2.5, 22);
-      ctx.fillStyle = '#334155';
-      ctx.fillRect(x - 17, y - 8, 8, 6);
-      ctx.fillStyle = '#78350f';
-      ctx.fillRect(x - 16, y - 26, 6, 3);
-
-      // Pickaxe stuck in excavation mound
-      ctx.fillStyle = '#451a03';
-      ctx.fillRect(x + 14, y - 20, 3, 18);
-      ctx.fillStyle = '#94a3b8';
-      ctx.beginPath();
-      ctx.moveTo(x + 9, y - 20);
-      ctx.lineTo(x + 22, y - 18);
-      ctx.lineTo(x + 15, y - 15);
-      ctx.closePath();
-      ctx.fill();
+      const spr = this.staticSpriteCache.get('trench_back_tier1_lvl0');
+      if (spr) {
+        ctx.drawImage(spr, x - 55, y - 30);
+      } else {
+        ctx.fillStyle = '#261406';
+        ctx.beginPath();
+        ctx.ellipse(x, y - 2, 46, 8, 0, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillStyle = '#140a03';
+        ctx.fillRect(x - 36, y - 5, 72, 6);
+        ctx.fillStyle = '#854d0e';
+        ctx.fillRect(x - 32, y - 22, 3.5, 22);
+        ctx.fillRect(x + 30, y - 22, 3.5, 22);
+      }
     } else if (hqTier === 3) {
       // TIER 3: KESME TAŞ VE ÇELİK MUHKEM TABYA SİPERİ (Stone Fortress Bastion Trench)
-      // 1. Subterranean stone masonry bunker cavity
-      ctx.fillStyle = '#0a0f1d';
-      ctx.fillRect(x - 52, y, 104, 38);
-
-      // Gallipoli limestone ashlar back wall
-      for (let sy = y; sy < y + 36; sy += 9) {
-        ctx.fillStyle = '#1e293b';
-        ctx.fillRect(x - 50, sy, 100, 1.2);
-      }
-      for (let sx = x - 48; sx < x + 48; sx += 22) {
+      const spr = this.staticSpriteCache.get(`trench_back_tier3_dir_${dir}`);
+      if (spr) {
+        ctx.drawImage(spr, x - 70, y - 40);
+      } else {
+        ctx.fillStyle = '#0a0f1d';
+        ctx.fillRect(x - 52, y, 104, 38);
         ctx.fillStyle = '#334155';
-        ctx.fillRect(sx, y, 5, 36);
+        ctx.fillRect(x - 52, y - 22, 104, 16);
       }
 
-      // Subterranean shelter dugout entrance in the rear center
-      ctx.fillStyle = '#020617';
-      ctx.fillRect(x - 18, y + 6, 36, 30);
-      ctx.fillStyle = '#475569';
-      ctx.fillRect(x - 20, y + 4, 40, 4); // Heavy stone lintel
-      ctx.fillStyle = '#334155';
-      ctx.fillRect(x - 20, y + 4, 4, 32); // Left stone pillar
-      ctx.fillRect(x + 16, y + 4, 4, 32); // Right stone pillar
-
-      // Warm interior bunker lantern glow
-      ctx.fillStyle = 'rgba(245, 158, 11, 0.45)';
-      ctx.beginPath();
-      ctx.ellipse(x, y + 22, 16, 12, 0, 0, Math.PI * 2);
-      ctx.fill();
-
-      // Rear stone retaining wall with crenellated parapet behind soldiers
-      ctx.fillStyle = '#334155';
-      ctx.fillRect(x - 52, y - 22, 104, 16);
-      ctx.fillStyle = '#1e293b';
-      ctx.fillRect(x - 52, y - 6, 104, 2);
-      // Stone bevel highlights
-      ctx.fillStyle = '#475569';
-      ctx.fillRect(x - 52, y - 22, 104, 1.5);
-      for (let bx = x - 50; bx < x + 50; bx += 20) {
-        ctx.fillStyle = '#1e293b';
-        ctx.fillRect(bx, y - 22, 1.5, 16);
-      }
-
-      // Wooden duckboard floor with drainage channel
-      ctx.fillStyle = '#78350f';
-      ctx.fillRect(x - 48, y + 32, 96, 5);
-      ctx.fillStyle = '#451a03';
-      for (let d = x - 46; d < x + 46; d += 8) {
-        ctx.fillRect(d, y + 32, 1.5, 5);
-      }
-
-      // Raised timber firing banquette (atış sekisi) where soldiers stand
-      ctx.fillStyle = '#92400e';
-      ctx.fillRect(x - 44, y - 4, 88, 5);
-
-      // Stacked artillery shell cases in rear corner
-      ctx.fillStyle = '#ca8a04';
-      const shellX = dir === -1 ? x + 34 : x - 42;
-      ctx.fillRect(shellX, y - 14, 3, 10);
-      ctx.fillRect(shellX + 4, y - 14, 3, 10);
-      ctx.fillRect(shellX + 2, y - 20, 3, 10);
-
-      // Ottoman Crescent Pennant flying high on the rear stone post
+      // Animated Ottoman Crescent Pennant waving atop the post
       const flagX = slot.side === 'left' ? x - 46 : x + 44;
-      ctx.fillStyle = '#64748b';
-      ctx.fillRect(flagX, y - 56, 3, 56);
       ctx.fillStyle = '#dc2626';
       const fWave = Math.sin(this.animTimer * 5) * 3;
       ctx.beginPath();
@@ -3291,96 +4025,29 @@ export class GameRenderer {
       ctx.fillRect(flagX + 5, y - 49, 3, 3);
     } else if (hqTier === 2) {
       // TIER 2: AHŞAP KÜTÜK SİPER & ŞARAPNEL SIĞINAĞI (Heavy Timber Trench & Shelter)
-      // 1. Ditch cavity below ground
-      ctx.fillStyle = '#170c06';
-      ctx.fillRect(x - 46, y, 92, 32);
-
-      // Timber revetment wall planks along the rear
-      ctx.fillStyle = '#451a03';
-      for (let p = x - 44; p < x + 44; p += 9) {
-        ctx.fillRect(p, y, 7.5, 30);
+      const spr = this.staticSpriteCache.get(`trench_back_tier2_dir_${dir}`);
+      if (spr) {
+        ctx.drawImage(spr, x - 65, y - 30);
+      } else {
+        ctx.fillStyle = '#170c06';
+        ctx.fillRect(x - 46, y, 92, 32);
       }
 
-      // Heavy vertical timber support posts
-      ctx.fillStyle = '#78350f';
-      ctx.fillRect(x - 42, y - 14, 5, 46);
-      ctx.fillRect(x + 37, y - 14, 5, 46);
-      ctx.fillRect(x - 2, y - 14, 5, 46);
-
-      // Rear splinter-proof dugout shelter roof (şarapnel sığınağı üstü)
-      const bunkerSide = dir === -1 ? x + 12 : x - 44;
-      ctx.fillStyle = '#271206';
-      ctx.fillRect(bunkerSide, y - 18, 32, 16);
-      ctx.fillStyle = '#572c0c';
-      ctx.fillRect(bunkerSide, y - 18, 32, 3); // log lintel
       // Sandbags on top of the rear shelter roof
+      const bunkerSide = dir === -1 ? x + 12 : x - 44;
       this.drawSandbagRow(bunkerSide + 2, y - 24, 2, 14, 6);
-
-      // Duckboard walkway on the trench floor
-      ctx.fillStyle = '#92400e';
-      ctx.fillRect(x - 42, y + 26, 84, 5);
-      ctx.fillStyle = '#451a03';
-      for (let d = x - 40; d < x + 40; d += 8) {
-        ctx.fillRect(d, y + 26, 1.5, 5);
-      }
-
-      // Raised wooden firing banquette (atış sekisi)
-      ctx.fillStyle = '#78350f';
-      ctx.fillRect(x - 40, y - 4, 80, 5);
 
       // Hanging storm kerosene hurricane lantern
       this.drawGasLantern(dir === -1 ? x + 32 : x - 34, y - 10);
-
-      // Wooden ammunition crate in rear
-      const crateX = dir === -1 ? x - 38 : x + 24;
-      ctx.fillStyle = '#78350f';
-      ctx.fillRect(crateX, y - 12, 14, 9);
-      ctx.fillStyle = '#451a03';
-      ctx.strokeRect(crateX, y - 12, 14, 9);
     } else {
       // TIER 1: GELİBOLU KUM TORBASI VE TOPRAK SİPERİ (Authentic Earthwork & Sandbag Trench)
-      // 1. Trench Cavity (Excavated soil depth below ground)
-      ctx.fillStyle = '#26160c';
-      ctx.fillRect(x - 38, y, 76, 26);
-
-      // Clay and chalk soil strata bands
-      ctx.fillStyle = '#3a2011';
-      ctx.fillRect(x - 38, y + 8, 76, 3);
-      ctx.fillStyle = '#4d3017';
-      ctx.fillRect(x - 38, y + 17, 76, 2);
-
-      // Timber revetment planks & fascine hurdles along trench back wall
-      ctx.fillStyle = '#451a03';
-      for (let p = x - 36; p < x + 34; p += 8) {
-        ctx.fillRect(p, y + 1, 6.5, 23);
+      const spr = this.staticSpriteCache.get(`trench_back_tier1_dir_${dir}`);
+      if (spr) {
+        ctx.drawImage(spr, x - 55, y - 25);
+      } else {
+        ctx.fillStyle = '#26160c';
+        ctx.fillRect(x - 38, y, 76, 26);
       }
-
-      // Wooden Duckboards on trench floor with drainage gap
-      ctx.fillStyle = '#78350f';
-      ctx.fillRect(x - 36, y + 21, 72, 4.5);
-      ctx.fillStyle = '#271206';
-      for (let d = x - 34; d < x + 32; d += 7) {
-        ctx.fillRect(d, y + 21, 1.2, 4.5);
-      }
-
-      // Raised wooden firing banquette (atış sekisi) where soldiers stand
-      ctx.fillStyle = '#854d0e';
-      ctx.fillRect(x - 34, y - 4, 68, 4.5);
-
-      // Wooden ammunition crate in corner
-      const boxX = dir === -1 ? x + 20 : x - 32;
-      ctx.fillStyle = '#78350f';
-      ctx.fillRect(boxX, y - 11, 12, 8);
-      ctx.fillStyle = '#451a03';
-      ctx.fillRect(boxX + 2, y - 9, 8, 1);
-
-      // Field telephone wire along trench wall
-      ctx.strokeStyle = '#64748b';
-      ctx.lineWidth = 1;
-      ctx.beginPath();
-      ctx.moveTo(x - 36, y - 2);
-      ctx.quadraticCurveTo(x, y + 4, x + 36, y - 2);
-      ctx.stroke();
     }
 
     if (slot.level > 0 && slot.health < slot.maxHealth) {
@@ -3391,7 +4058,7 @@ export class GameRenderer {
   }
 
   // --- Front Parapets (Sandbags, Timber Wall, Stone Wall rendered directly IN FRONT of soldiers) ---
-  private drawTrenchFrontParapets(slots: BuildSlot[], camX: number, soldiers: Soldier[] = []) {
+  private drawTrenchFrontParapets(slots: BuildSlot[], camX: number, _soldiers: Soldier[] = []) {
     const ctx = this.ctx;
     const gY = this.groundY;
 
@@ -3405,116 +4072,42 @@ export class GameRenderer {
       if (sx < -80 || sx > this.width + 80) continue;
 
       ctx.save();
-      const dir = slot.side === 'left' ? -1 : 1;
 
       if (hqTier === 3) {
         // TIER 3: TAŞ TABYA ÖN SİPERİ (Stone Fortress Bastion Front Parapet)
-        const wallW = 96;
-        const wallH = 20;
-        const startX = sx - wallW / 2;
-
-        // Base foundation berm
-        ctx.fillStyle = '#1e293b';
-        ctx.fillRect(startX - 2, gY - wallH, wallW + 4, wallH + 4);
-
-        // Ashlar Stone Blocks Pattern
-        for (let row = 0; row < 3; row++) {
-          const rowY = gY - wallH + row * 6.5;
-          const offset = (row % 2) * 12;
-          for (let bx = startX - offset; bx < startX + wallW; bx += 24) {
-            const blockX = Math.max(startX, bx);
-            const blockW = Math.min(23, startX + wallW - blockX);
-            if (blockW <= 0) continue;
-            ctx.fillStyle = (bx % 48 === 0) ? '#475569' : '#334155';
-            ctx.fillRect(blockX, rowY, blockW, 6);
-            // Stone bevel highlight
-            ctx.fillStyle = '#64748b';
-            ctx.fillRect(blockX, rowY, blockW, 1);
-            // Shadow base
-            ctx.fillStyle = '#1e293b';
-            ctx.fillRect(blockX, rowY + 5, blockW, 1);
-          }
+        const spr = this.staticSpriteCache.get('trench_front_tier3');
+        if (spr) {
+          ctx.drawImage(spr, sx - 65, gY - 35);
+        } else {
+          ctx.fillStyle = '#1e293b';
+          ctx.fillRect(sx - 48, gY - 20, 96, 24);
         }
-
-        // Stone Crenellations / Mazgal Dişleri (Rifle firing notches)
-        ctx.fillStyle = '#334155';
-        for (let i = 0; i < 4; i++) {
-          const merlonX = startX + 4 + i * 24;
-          ctx.fillRect(merlonX, gY - wallH - 6, 14, 6);
-          ctx.fillStyle = '#64748b';
-          ctx.fillRect(merlonX, gY - wallH - 6, 14, 1.2);
-          ctx.fillStyle = '#334155';
-        }
-
-        // Steel Armoured Firing Shield with rifle slit
-        ctx.fillStyle = '#1e293b';
-        ctx.fillRect(sx - 16, gY - wallH - 3, 32, 5.5);
-        ctx.fillStyle = '#0f172a';
-        ctx.fillRect(sx - 8, gY - wallH - 1.5, 16, 2.5); // rifle rest slit
-        ctx.fillStyle = '#94a3b8'; // Rivets
-        ctx.fillRect(sx - 14, gY - wallH - 2, 2, 2);
-        ctx.fillRect(sx + 12, gY - wallH - 2, 2, 2);
       } else if (hqTier === 2) {
         // TIER 2: ODUN DUVAR ÖN SİPERİ (Heavy Timber Log Front Parapet)
-        const wallW = 88;
-        const wallH = 18;
-        const startX = sx - wallW / 2;
-
-        // Base dirt mound
-        ctx.fillStyle = '#451a03';
-        ctx.fillRect(startX - 2, gY - 4, wallW + 4, 6);
-
-        // Vertical Log Stakes
-        const logWidth = 7;
-        for (let lx = startX; lx < startX + wallW; lx += logWidth) {
-          const logH = wallH + ((lx % 14 === 0) ? 2 : 0);
-          ctx.fillStyle = (lx % 14 === 0) ? '#78350f' : '#92400e';
-          ctx.fillRect(lx, gY - logH, logWidth - 1, logH);
-
-          // Pointed log spear top
-          ctx.beginPath();
-          ctx.moveTo(lx, gY - logH);
-          ctx.lineTo(lx + (logWidth - 1) / 2, gY - logH - 3);
-          ctx.lineTo(lx + logWidth - 1, gY - logH);
-          ctx.fill();
-
-          // Wood bark highlight
-          ctx.fillStyle = '#b45309';
-          ctx.fillRect(lx + 1, gY - logH + 2, 1.5, logH - 4);
+        const spr = this.staticSpriteCache.get('trench_front_tier2');
+        if (spr) {
+          ctx.drawImage(spr, sx - 60, gY - 30);
+        } else {
+          ctx.fillStyle = '#78350f';
+          ctx.fillRect(sx - 44, gY - 18, 88, 22);
         }
-
-        // Horizontal Iron-Reinforced Timber Crossbeam
-        ctx.fillStyle = '#451a03';
-        ctx.fillRect(startX - 2, gY - 12, wallW + 4, 4);
-        ctx.fillStyle = '#334155'; // Iron studs/rivets
-        for (let rx = startX + 4; rx < startX + wallW; rx += 12) {
-          ctx.fillRect(rx, gY - 11, 2, 2);
-        }
-
-        // Rifle Firing Port Cutouts between logs
-        ctx.fillStyle = '#1c0d02';
-        ctx.fillRect(sx - 20, gY - 9, 10, 3);
-        ctx.fillRect(sx + 10, gY - 9, 10, 3);
       } else {
         // TIER 1: KUM TORBALARI ÖN SİPERİ (Sandbag Breastwork Front Parapet)
-        const bermW = slot.level >= 3 ? 90 : (slot.level === 2 ? 86 : 82);
-        const startX = sx - bermW / 2;
-
-        // Earth embankment base with grass & gravel
-        ctx.fillStyle = '#4d3017';
-        ctx.beginPath();
-        ctx.ellipse(sx, gY - 3, bermW / 2 + 2, 7, 0, 0, Math.PI * 2);
-        ctx.fill();
-
-        // Row 1: Bottom sandbag row
-        this.drawSandbagRow(startX + 4, gY - 8, 5, 15, 7.5);
-
-        // Row 2: Upper sandbag row with rifle rest notches
-        this.drawSandbagRow(startX + 11, gY - 14.5, 4, 15, 7.5);
-
-        // Row 3: Reinforced heavy tier for Level 3
-        if (slot.level >= 3) {
-          this.drawSandbagRow(startX + 18, gY - 20, 3, 15, 7);
+        const spr = this.staticSpriteCache.get(`trench_front_tier1_lvl${slot.level}`);
+        if (spr) {
+          ctx.drawImage(spr, sx - 60, gY - 30);
+        } else {
+          const bermW = slot.level >= 3 ? 90 : (slot.level === 2 ? 86 : 82);
+          const startX = sx - bermW / 2;
+          ctx.fillStyle = '#4d3017';
+          ctx.beginPath();
+          ctx.ellipse(sx, gY - 3, bermW / 2 + 2, 7, 0, 0, Math.PI * 2);
+          ctx.fill();
+          this.drawSandbagRow(startX + 4, gY - 8, 5, 15, 7.5);
+          this.drawSandbagRow(startX + 11, gY - 14.5, 4, 15, 7.5);
+          if (slot.level >= 3) {
+            this.drawSandbagRow(startX + 18, gY - 20, 3, 15, 7);
+          }
         }
       }
 
@@ -5128,72 +5721,45 @@ export class GameRenderer {
 
     if (slot.isScavenged) {
       // Chopped Tree Stumps with visible rings and wood chips on cleared meadow
-      // Main stump
-      ctx.fillStyle = '#572c0c';
-      ctx.fillRect(x - 14, y - 10, 12, 10);
-      ctx.fillStyle = '#d97706'; // Top ring
-      ctx.beginPath();
-      ctx.ellipse(x - 8, y - 10, 6, 2.5, 0, 0, Math.PI * 2);
-      ctx.fill();
-
-      // Second smaller stump
-      ctx.fillStyle = '#78350f';
-      ctx.fillRect(x + 5, y - 7, 9, 7);
-      ctx.fillStyle = '#b45309';
-      ctx.beginPath();
-      ctx.ellipse(x + 9.5, y - 7, 4.5, 2, 0, 0, Math.PI * 2);
-      ctx.fill();
-
-      // Scattered wood chips on flat grass
-      ctx.fillStyle = '#fde68a';
-      ctx.fillRect(x - 18, y - 3, 3, 2);
-      ctx.fillRect(x + 16, y - 4, 4, 2);
-      ctx.fillRect(x - 2, y - 2, 3, 2);
+      const spr = this.staticSpriteCache.get('tree_grove_scavenged');
+      if (spr) {
+        ctx.drawImage(spr, x - 55, y - 35);
+      } else {
+        // Fallback
+        ctx.fillStyle = '#572c0c';
+        ctx.fillRect(x - 14, y - 10, 12, 10);
+        ctx.fillStyle = '#d97706';
+        ctx.beginPath();
+        ctx.ellipse(x - 8, y - 10, 6, 2.5, 0, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillStyle = '#78350f';
+        ctx.fillRect(x + 5, y - 7, 9, 7);
+        ctx.fillStyle = '#b45309';
+        ctx.beginPath();
+        ctx.ellipse(x + 9.5, y - 7, 4.5, 2, 0, 0, Math.PI * 2);
+        ctx.fill();
+      }
     } else {
-      // Gallipoli Turkish Pine Trees (Çam Ağaçları) with gentle breeze animation
-      const trees = [-18, 0, 18];
-      const windSway = Math.sin(this.animTimer * 1.5 + (slot.x || 0) * 0.005) * 2.5;
-
-      for (let i = 0; i < trees.length; i++) {
-        const ox = trees[i];
-        const tx = x + ox;
-        const trunkH = i === 1 ? 48 : 38;
-        const foliageScale = i === 1 ? 1.15 : 0.95;
-
-        // Trunk
-        ctx.fillStyle = '#451a03';
-        ctx.fillRect(tx - 3, y - trunkH, 6, trunkH);
-
-        // Bark texture
-        ctx.fillStyle = '#290f02';
-        ctx.fillRect(tx - 1, y - trunkH + 8, 2, trunkH - 12);
-
-        // Lower foliage layer
-        ctx.fillStyle = '#14532d';
-        ctx.beginPath();
-        ctx.moveTo(tx - 20 * foliageScale, y - trunkH * 0.45);
-        ctx.lineTo(tx + windSway, y - trunkH * 1.1);
-        ctx.lineTo(tx + 20 * foliageScale, y - trunkH * 0.45);
-        ctx.closePath();
-        ctx.fill();
-
-        // Mid foliage layer
-        ctx.fillStyle = '#166534';
-        ctx.beginPath();
-        ctx.moveTo(tx - 16 * foliageScale, y - trunkH * 0.8);
-        ctx.lineTo(tx + windSway * 1.2, y - trunkH * 1.45);
-        ctx.lineTo(tx + 16 * foliageScale, y - trunkH * 0.8);
-        ctx.closePath();
-        ctx.fill();
-
-        // Top crown layer
-        ctx.fillStyle = '#15803d';
-        ctx.beginPath();
-        ctx.moveTo(tx - 11 * foliageScale, y - trunkH * 1.15);
-        ctx.lineTo(tx + windSway * 1.5, y - trunkH * 1.75);
-        ctx.lineTo(tx + 11 * foliageScale, y - trunkH * 1.15);
-        ctx.closePath();
-        ctx.fill();
+      // Gallipoli Turkish Pine Trees (pre-rendered from OffscreenCanvas texture cache)
+      const spr = this.staticSpriteCache.get('tree_grove_unscavenged');
+      if (spr) {
+        ctx.drawImage(spr, x - 70, y - 115);
+      } else {
+        // Fallback
+        const trees = [-18, 0, 18];
+        for (let i = 0; i < trees.length; i++) {
+          const tx = x + trees[i];
+          const trunkH = i === 1 ? 48 : 38;
+          ctx.fillStyle = '#451a03';
+          ctx.fillRect(tx - 3, y - trunkH, 6, trunkH);
+          ctx.fillStyle = '#14532d';
+          ctx.beginPath();
+          ctx.moveTo(tx - 20, y - trunkH * 0.45);
+          ctx.lineTo(tx, y - trunkH * 1.1);
+          ctx.lineTo(tx + 20, y - trunkH * 0.45);
+          ctx.closePath();
+          ctx.fill();
+        }
       }
 
       // Kingdom-style Marked Tree: Carved Cross on the central trunk & Overhead Status
@@ -5562,6 +6128,513 @@ export class GameRenderer {
     ctx.restore();
   }
 
+  /**
+   * Pre-renders static pixel art elements (trees, pine variants, trenches, front parapets)
+   * into persistent OffscreenCanvases for single-blit drawImage rendering (0 CPU overhead during movement)
+   */
+  private preRenderStaticSprites() {
+    // 1. Background Pine Trees (Day and Night variants at 4 quantization scales)
+    const pineScales: { key: string; scale: number }[] = [
+      { key: '100', scale: 1.0 },
+      { key: '75', scale: 0.75 },
+      { key: '50', scale: 0.50 },
+      { key: '35', scale: 0.35 }
+    ];
+
+    for (const isNight of [false, true]) {
+      for (const { key, scale } of pineScales) {
+        const trunkH = Math.round(130 * scale);
+        const trunkW = Math.max(2, Math.round(7 * scale));
+        const cW = Math.max(20, Math.round(70 * scale));
+        const cH = Math.round(trunkH + 20);
+
+        const offCanvas = document.createElement('canvas');
+        offCanvas.width = cW;
+        offCanvas.height = cH;
+        const oCtx = offCanvas.getContext('2d')!;
+
+        const ox = Math.round(cW / 2);
+        const oy = cH;
+
+        // Trunk
+        oCtx.fillStyle = isNight ? '#0f1710' : '#1c2e17';
+        oCtx.fillRect(ox - Math.round(trunkW / 2), oy - trunkH, trunkW, trunkH);
+
+        // Canopy tiers
+        const greenDark = isNight ? '#08170a' : '#143818';
+        const greenMid = isNight ? '#0c220f' : '#1e4d22';
+
+        for (let layer = 0; layer < 4; layer++) {
+          const layerY = oy - trunkH * 0.4 - layer * (28 * scale);
+          const layerW = (48 - layer * 8) * scale;
+          const layerH = 34 * scale;
+
+          oCtx.fillStyle = layer % 2 === 0 ? greenDark : greenMid;
+          oCtx.beginPath();
+          oCtx.moveTo(ox - layerW / 2, layerY);
+          oCtx.lineTo(ox, layerY - layerH);
+          oCtx.lineTo(ox + layerW / 2, layerY);
+          oCtx.closePath();
+          oCtx.fill();
+        }
+
+        this.staticSpriteCache.set(`pine_${isNight ? 'night' : 'day'}_${key}`, offCanvas);
+      }
+    }
+
+    // 2. Tree Grove Sprites (Scavenge Wood slot)
+    // 2.1 Unscavenged Living Turkish Pine Grove
+    {
+      const offCanvas = document.createElement('canvas');
+      offCanvas.width = 140;
+      offCanvas.height = 130;
+      const oCtx = offCanvas.getContext('2d')!;
+      const ox = 70;
+      const oy = 115;
+
+      const trees = [-18, 0, 18];
+      for (let i = 0; i < trees.length; i++) {
+        const tx = ox + trees[i];
+        const trunkH = i === 1 ? 48 : 38;
+        const foliageScale = i === 1 ? 1.15 : 0.95;
+
+        // Trunk
+        oCtx.fillStyle = '#451a03';
+        oCtx.fillRect(tx - 3, oy - trunkH, 6, trunkH);
+
+        // Bark texture
+        oCtx.fillStyle = '#290f02';
+        oCtx.fillRect(tx - 1, oy - trunkH + 8, 2, trunkH - 12);
+
+        // Lower foliage layer
+        oCtx.fillStyle = '#14532d';
+        oCtx.beginPath();
+        oCtx.moveTo(tx - 20 * foliageScale, oy - trunkH * 0.45);
+        oCtx.lineTo(tx, oy - trunkH * 1.1);
+        oCtx.lineTo(tx + 20 * foliageScale, oy - trunkH * 0.45);
+        oCtx.closePath();
+        oCtx.fill();
+
+        // Mid foliage layer
+        oCtx.fillStyle = '#166534';
+        oCtx.beginPath();
+        oCtx.moveTo(tx - 16 * foliageScale, oy - trunkH * 0.8);
+        oCtx.lineTo(tx, oy - trunkH * 1.45);
+        oCtx.lineTo(tx + 16 * foliageScale, oy - trunkH * 0.8);
+        oCtx.closePath();
+        oCtx.fill();
+
+        // Top crown layer
+        oCtx.fillStyle = '#15803d';
+        oCtx.beginPath();
+        oCtx.moveTo(tx - 11 * foliageScale, oy - trunkH * 1.15);
+        oCtx.lineTo(tx, oy - trunkH * 1.75);
+        oCtx.lineTo(tx + 11 * foliageScale, oy - trunkH * 1.15);
+        oCtx.closePath();
+        oCtx.fill();
+      }
+      this.staticSpriteCache.set('tree_grove_unscavenged', offCanvas);
+    }
+
+    // 2.2 Scavenged Pine Stumps & Meadow Woodchips
+    {
+      const offCanvas = document.createElement('canvas');
+      offCanvas.width = 110;
+      offCanvas.height = 45;
+      const oCtx = offCanvas.getContext('2d')!;
+      const ox = 55;
+      const oy = 35;
+
+      // Main stump
+      oCtx.fillStyle = '#572c0c';
+      oCtx.fillRect(ox - 14, oy - 10, 12, 10);
+      oCtx.fillStyle = '#d97706';
+      oCtx.beginPath();
+      oCtx.ellipse(ox - 8, oy - 10, 6, 2.5, 0, 0, Math.PI * 2);
+      oCtx.fill();
+
+      // Second smaller stump
+      oCtx.fillStyle = '#78350f';
+      oCtx.fillRect(ox + 5, oy - 7, 9, 7);
+      oCtx.fillStyle = '#b45309';
+      oCtx.beginPath();
+      oCtx.ellipse(ox + 9.5, oy - 7, 4.5, 2, 0, 0, Math.PI * 2);
+      oCtx.fill();
+
+      // Scattered wood chips on flat grass
+      oCtx.fillStyle = '#fde68a';
+      oCtx.fillRect(ox - 18, oy - 3, 3, 2);
+      oCtx.fillRect(ox + 16, oy - 4, 4, 2);
+      oCtx.fillRect(ox - 2, oy - 2, 3, 2);
+
+      this.staticSpriteCache.set('tree_grove_scavenged', offCanvas);
+    }
+
+    // 3. Static Trench Back Cavities (Tier 1 unbuilt, Tier 1 built, Tier 2, Tier 3)
+    // 3.1 Unbuilt Blueprint Excavation Plot
+    {
+      const offCanvas = document.createElement('canvas');
+      offCanvas.width = 110;
+      offCanvas.height = 55;
+      const oCtx = offCanvas.getContext('2d')!;
+      const ox = 55;
+      const oy = 30;
+
+      oCtx.fillStyle = '#261406';
+      oCtx.beginPath();
+      oCtx.ellipse(ox, oy - 2, 46, 8, 0, 0, Math.PI * 2);
+      oCtx.fill();
+
+      oCtx.fillStyle = '#140a03';
+      oCtx.fillRect(ox - 36, oy - 5, 72, 6);
+
+      oCtx.fillStyle = '#854d0e';
+      oCtx.fillRect(ox - 32, oy - 22, 3.5, 22);
+      oCtx.fillRect(ox - 12, oy - 18, 3, 18);
+      oCtx.fillRect(ox + 12, oy - 18, 3, 18);
+      oCtx.fillRect(ox + 30, oy - 22, 3.5, 22);
+
+      oCtx.strokeStyle = '#fde047';
+      oCtx.lineWidth = 1.2;
+      oCtx.beginPath();
+      oCtx.moveTo(ox - 32, oy - 15);
+      oCtx.lineTo(ox + 30, oy - 15);
+      oCtx.stroke();
+
+      oCtx.fillStyle = '#64748b';
+      oCtx.fillRect(ox - 14, oy - 24, 2.5, 22);
+      oCtx.fillStyle = '#334155';
+      oCtx.fillRect(ox - 17, oy - 8, 8, 6);
+      oCtx.fillStyle = '#78350f';
+      oCtx.fillRect(ox - 16, oy - 26, 6, 3);
+
+      oCtx.fillStyle = '#451a03';
+      oCtx.fillRect(ox + 14, oy - 20, 3, 18);
+      oCtx.fillStyle = '#94a3b8';
+      oCtx.beginPath();
+      oCtx.moveTo(ox + 9, oy - 20);
+      oCtx.lineTo(ox + 22, oy - 18);
+      oCtx.lineTo(ox + 15, oy - 15);
+      oCtx.closePath();
+      oCtx.fill();
+
+      this.staticSpriteCache.set('trench_back_tier1_lvl0', offCanvas);
+    }
+
+    // 3.2 Tier 1 Built Earthwork & Sandbag Trench Back
+    for (const dir of [-1, 1]) {
+      const offCanvas = document.createElement('canvas');
+      offCanvas.width = 110;
+      offCanvas.height = 65;
+      const oCtx = offCanvas.getContext('2d')!;
+      const ox = 55;
+      const oy = 25;
+
+      oCtx.fillStyle = '#26160c';
+      oCtx.fillRect(ox - 38, oy, 76, 26);
+
+      oCtx.fillStyle = '#3a2011';
+      oCtx.fillRect(ox - 38, oy + 8, 76, 3);
+      oCtx.fillStyle = '#4d3017';
+      oCtx.fillRect(ox - 38, oy + 17, 76, 2);
+
+      oCtx.fillStyle = '#451a03';
+      for (let p = ox - 36; p < ox + 34; p += 8) {
+        oCtx.fillRect(p, oy + 1, 6.5, 23);
+      }
+
+      oCtx.fillStyle = '#78350f';
+      oCtx.fillRect(ox - 36, oy + 21, 72, 4.5);
+      oCtx.fillStyle = '#271206';
+      for (let d = ox - 34; d < ox + 32; d += 7) {
+        oCtx.fillRect(d, oy + 21, 1.2, 4.5);
+      }
+
+      oCtx.fillStyle = '#854d0e';
+      oCtx.fillRect(ox - 34, oy - 4, 68, 4.5);
+
+      const boxX = dir === -1 ? ox + 20 : ox - 32;
+      oCtx.fillStyle = '#78350f';
+      oCtx.fillRect(boxX, oy - 11, 12, 8);
+      oCtx.fillStyle = '#451a03';
+      oCtx.fillRect(boxX + 2, oy - 9, 8, 1);
+
+      oCtx.strokeStyle = '#64748b';
+      oCtx.lineWidth = 1;
+      oCtx.beginPath();
+      oCtx.moveTo(ox - 36, oy - 2);
+      oCtx.quadraticCurveTo(ox, oy + 4, ox + 36, oy - 2);
+      oCtx.stroke();
+
+      this.staticSpriteCache.set(`trench_back_tier1_dir_${dir}`, offCanvas);
+    }
+
+    // 3.3 Tier 2 Heavy Timber Trench Back
+    for (const dir of [-1, 1]) {
+      const offCanvas = document.createElement('canvas');
+      offCanvas.width = 130;
+      offCanvas.height = 75;
+      const oCtx = offCanvas.getContext('2d')!;
+      const ox = 65;
+      const oy = 30;
+
+      oCtx.fillStyle = '#170c06';
+      oCtx.fillRect(ox - 46, oy, 92, 32);
+
+      oCtx.fillStyle = '#451a03';
+      for (let p = ox - 44; p < ox + 44; p += 9) {
+        oCtx.fillRect(p, oy, 7.5, 30);
+      }
+
+      oCtx.fillStyle = '#78350f';
+      oCtx.fillRect(ox - 42, oy - 14, 5, 46);
+      oCtx.fillRect(ox + 37, oy - 14, 5, 46);
+      oCtx.fillRect(ox - 2, oy - 14, 5, 46);
+
+      const bunkerSide = dir === -1 ? ox + 12 : ox - 44;
+      oCtx.fillStyle = '#271206';
+      oCtx.fillRect(bunkerSide, oy - 18, 32, 16);
+      oCtx.fillStyle = '#572c0c';
+      oCtx.fillRect(bunkerSide, oy - 18, 32, 3);
+
+      oCtx.fillStyle = '#92400e';
+      oCtx.fillRect(ox - 42, oy + 26, 84, 5);
+      oCtx.fillStyle = '#451a03';
+      for (let d = ox - 40; d < ox + 40; d += 8) {
+        oCtx.fillRect(d, oy + 26, 1.5, 5);
+      }
+
+      oCtx.fillStyle = '#78350f';
+      oCtx.fillRect(ox - 40, oy - 4, 80, 5);
+
+      const crateX = dir === -1 ? ox - 38 : ox + 24;
+      oCtx.fillStyle = '#78350f';
+      oCtx.fillRect(crateX, oy - 12, 14, 9);
+      oCtx.fillStyle = '#451a03';
+      oCtx.strokeRect(crateX, oy - 12, 14, 9);
+
+      this.staticSpriteCache.set(`trench_back_tier2_dir_${dir}`, offCanvas);
+    }
+
+    // 3.4 Tier 3 Stone Bastion Trench Back
+    for (const dir of [-1, 1]) {
+      const offCanvas = document.createElement('canvas');
+      offCanvas.width = 140;
+      offCanvas.height = 95;
+      const oCtx = offCanvas.getContext('2d')!;
+      const ox = 70;
+      const oy = 40;
+
+      oCtx.fillStyle = '#0a0f1d';
+      oCtx.fillRect(ox - 52, oy, 104, 38);
+
+      for (let sy = oy; sy < oy + 36; sy += 9) {
+        oCtx.fillStyle = '#1e293b';
+        oCtx.fillRect(ox - 50, sy, 100, 1.2);
+      }
+      for (let sx = ox - 48; sx < ox + 48; sx += 22) {
+        oCtx.fillStyle = '#334155';
+        oCtx.fillRect(sx, oy, 5, 36);
+      }
+
+      oCtx.fillStyle = '#020617';
+      oCtx.fillRect(ox - 18, oy + 6, 36, 30);
+      oCtx.fillStyle = '#475569';
+      oCtx.fillRect(ox - 20, oy + 4, 40, 4);
+      oCtx.fillStyle = '#334155';
+      oCtx.fillRect(ox - 20, oy + 4, 4, 32);
+      oCtx.fillRect(ox + 16, oy + 4, 4, 32);
+
+      oCtx.fillStyle = 'rgba(245, 158, 11, 0.45)';
+      oCtx.beginPath();
+      oCtx.ellipse(ox, oy + 22, 16, 12, 0, 0, Math.PI * 2);
+      oCtx.fill();
+
+      oCtx.fillStyle = '#334155';
+      oCtx.fillRect(ox - 52, oy - 22, 104, 16);
+      oCtx.fillStyle = '#1e293b';
+      oCtx.fillRect(ox - 52, oy - 6, 104, 2);
+      oCtx.fillStyle = '#475569';
+      oCtx.fillRect(ox - 52, oy - 22, 104, 1.5);
+      for (let bx = ox - 50; bx < ox + 50; bx += 20) {
+        oCtx.fillStyle = '#1e293b';
+        oCtx.fillRect(bx, oy - 22, 1.5, 16);
+      }
+
+      oCtx.fillStyle = '#78350f';
+      oCtx.fillRect(ox - 48, oy + 32, 96, 5);
+      oCtx.fillStyle = '#451a03';
+      for (let d = ox - 46; d < ox + 46; d += 8) {
+        oCtx.fillRect(d, oy + 32, 1.5, 5);
+      }
+
+      oCtx.fillStyle = '#92400e';
+      oCtx.fillRect(ox - 44, oy - 4, 88, 5);
+
+      oCtx.fillStyle = '#ca8a04';
+      const shellX = dir === -1 ? ox + 34 : ox - 42;
+      oCtx.fillRect(shellX, oy - 14, 3, 10);
+      oCtx.fillRect(shellX + 4, oy - 14, 3, 10);
+      oCtx.fillRect(shellX + 2, oy - 20, 3, 10);
+
+      const flagX = dir === -1 ? ox - 46 : ox + 44;
+      oCtx.fillStyle = '#64748b';
+      oCtx.fillRect(flagX, oy - 56, 3, 56);
+
+      this.staticSpriteCache.set(`trench_back_tier3_dir_${dir}`, offCanvas);
+    }
+
+    // 4. Trench Front Parapets (Sandbags, Timber Wall, Stone Bastion)
+    // 4.1 Tier 1 Sandbag Parapets (Levels 1, 2, 3)
+    for (let lvl = 1; lvl <= 3; lvl++) {
+      const bermW = lvl >= 3 ? 90 : (lvl === 2 ? 86 : 82);
+      const offCanvas = document.createElement('canvas');
+      offCanvas.width = 120;
+      offCanvas.height = 40;
+      const oCtx = offCanvas.getContext('2d')!;
+      const ox = 60;
+      const oy = 30;
+
+      oCtx.fillStyle = '#4d3017';
+      oCtx.beginPath();
+      oCtx.ellipse(ox, oy - 3, bermW / 2 + 2, 7, 0, 0, Math.PI * 2);
+      oCtx.fill();
+
+      // Helper for sandbags on offscreen canvas
+      const drawBags = (startX: number, bagY: number, count: number, bagW: number, bagH: number) => {
+        for (let i = 0; i < count; i++) {
+          const bx = startX + i * (bagW - 2);
+          oCtx.fillStyle = (i % 2 === 0) ? '#a89a74' : '#8c7e5a';
+          oCtx.fillRect(bx, bagY, bagW, bagH);
+          oCtx.strokeStyle = '#7c6c49';
+          oCtx.lineWidth = 0.8;
+          oCtx.strokeRect(bx + 0.5, bagY + 0.5, bagW - 1, bagH - 1);
+          oCtx.fillStyle = '#9f8e67';
+          oCtx.fillRect(bx + bagW - 2.5, bagY + bagH * 0.25, 2.5, bagH * 0.5);
+        }
+      };
+
+      const startX = ox - bermW / 2;
+      drawBags(startX + 4, oy - 8, 5, 15, 7.5);
+      drawBags(startX + 11, oy - 14.5, 4, 15, 7.5);
+      if (lvl >= 3) {
+        drawBags(startX + 18, oy - 20, 3, 15, 7);
+      }
+
+      this.staticSpriteCache.set(`trench_front_tier1_lvl${lvl}`, offCanvas);
+    }
+
+    // 4.2 Tier 2 Timber Parapet
+    {
+      const wallW = 88;
+      const wallH = 18;
+      const offCanvas = document.createElement('canvas');
+      offCanvas.width = 120;
+      offCanvas.height = 40;
+      const oCtx = offCanvas.getContext('2d')!;
+      const ox = 60;
+      const oy = 30;
+      const startX = ox - wallW / 2;
+
+      oCtx.fillStyle = '#451a03';
+      oCtx.fillRect(startX - 2, oy - 4, wallW + 4, 6);
+
+      const logWidth = 7;
+      for (let lx = startX; lx < startX + wallW; lx += logWidth) {
+        const logH = wallH + ((lx % 14 === 0) ? 2 : 0);
+        oCtx.fillStyle = (lx % 14 === 0) ? '#78350f' : '#92400e';
+        oCtx.fillRect(lx, oy - logH, logWidth - 1, logH);
+
+        oCtx.beginPath();
+        oCtx.moveTo(lx, oy - logH);
+        oCtx.lineTo(lx + (logWidth - 1) / 2, oy - logH - 3);
+        oCtx.lineTo(lx + logWidth - 1, oy - logH);
+        oCtx.fill();
+
+        oCtx.fillStyle = '#b45309';
+        oCtx.fillRect(lx + 1, oy - logH + 2, 1.5, logH - 4);
+      }
+
+      oCtx.fillStyle = '#451a03';
+      oCtx.fillRect(startX - 2, oy - 12, wallW + 4, 4);
+      oCtx.fillStyle = '#334155';
+      for (let rx = startX + 4; rx < startX + wallW; rx += 12) {
+        oCtx.fillRect(rx, oy - 11, 2, 2);
+      }
+
+      oCtx.fillStyle = '#1c0d02';
+      oCtx.fillRect(ox - 20, oy - 9, 10, 3);
+      oCtx.fillRect(ox + 10, oy - 9, 10, 3);
+
+      this.staticSpriteCache.set('trench_front_tier2', offCanvas);
+    }
+
+    // 4.3 Tier 3 Stone Bastion Parapet
+    {
+      const wallW = 96;
+      const wallH = 20;
+      const offCanvas = document.createElement('canvas');
+      offCanvas.width = 130;
+      offCanvas.height = 45;
+      const oCtx = offCanvas.getContext('2d')!;
+      const ox = 65;
+      const oy = 35;
+      const startX = ox - wallW / 2;
+
+      oCtx.fillStyle = '#1e293b';
+      oCtx.fillRect(startX - 2, oy - wallH, wallW + 4, wallH + 4);
+
+      for (let row = 0; row < 3; row++) {
+        const rowY = oy - wallH + row * 6.5;
+        const offset = (row % 2) * 12;
+        for (let bx = startX - offset; bx < startX + wallW; bx += 24) {
+          const blockX = Math.max(startX, bx);
+          const blockW = Math.min(23, startX + wallW - blockX);
+          if (blockW <= 0) continue;
+          oCtx.fillStyle = (bx % 48 === 0) ? '#475569' : '#334155';
+          oCtx.fillRect(blockX, rowY, blockW, 6);
+          oCtx.fillStyle = '#64748b';
+          oCtx.fillRect(blockX, rowY, blockW, 1);
+          oCtx.fillStyle = '#1e293b';
+          oCtx.fillRect(blockX, rowY + 5, blockW, 1);
+        }
+      }
+
+      oCtx.fillStyle = '#334155';
+      for (let i = 0; i < 4; i++) {
+        const merlonX = startX + 4 + i * 24;
+        oCtx.fillRect(merlonX, oy - wallH - 6, 14, 6);
+        oCtx.fillStyle = '#64748b';
+        oCtx.fillRect(merlonX, oy - wallH - 6, 14, 1.2);
+        oCtx.fillStyle = '#334155';
+      }
+
+      oCtx.fillStyle = '#1e293b';
+      oCtx.fillRect(ox - 16, oy - wallH - 3, 32, 5.5);
+      oCtx.fillStyle = '#0f172a';
+      oCtx.fillRect(ox - 8, oy - wallH - 1.5, 16, 2.5);
+      oCtx.fillStyle = '#94a3b8';
+      oCtx.fillRect(ox - 14, oy - wallH - 2, 2, 2);
+      oCtx.fillRect(ox + 12, oy - wallH - 2, 2, 2);
+
+      this.staticSpriteCache.set('trench_front_tier3', offCanvas);
+    }
+  }
+
+  /**
+  * Full Level Preloading and Asset Warming (Zero in-game stuttering / locked 60 FPS)
+  */
+  public preloadLevelAssets() {
+    this.preRenderStaticSprites();
+    this.terrainBufferKey = '';
+    this.hillsBufferKey = '';
+    this.forestBufferDirty = true;
+    // Warm up and clear light canvas
+    if (this.lightCtx) {
+      this.lightCtx.clearRect(0, 0, this.width, this.height);
+    }
+  }
+
   private drawRelicShrine(x: number, y: number, slot: BuildSlot) {
     const ctx = this.ctx;
     ctx.save();
@@ -5571,459 +6644,476 @@ export class GameRenderer {
     const maxCoins = 8;
     const isDamage = slot.id.includes('statue_damage');
     const isHealth = slot.id.includes('statue_health');
-    const isDefense = slot.id.includes('statue_defense');
 
-    // 1. Grand Stepped Classical Marble Monument Pedestal (Kaide)
-    // Bottom plinth
-    ctx.fillStyle = '#334155';
-    ctx.fillRect(x - 30, y - 8, 60, 8);
-    ctx.fillStyle = '#475569';
-    ctx.fillRect(x - 29, y - 7, 58, 2);
+    // Floating vertical bobbing animation when unlocked
+    let floatY = 0;
+    if (isUnlocked) {
+      floatY = Math.sin(this.animTimer * 3) * 3;
 
-    // Middle pedestal body
-    ctx.fillStyle = '#475569';
-    ctx.fillRect(x - 25, y - 30, 50, 22);
-    // Pedestal side pilasters
-    ctx.fillStyle = '#334155';
-    ctx.fillRect(x - 25, y - 30, 4, 22);
-    ctx.fillRect(x + 21, y - 30, 4, 22);
-
-    // Top capital slab / cornice
-    ctx.fillStyle = '#64748b';
-    ctx.fillRect(x - 28, y - 34, 56, 4);
-    ctx.fillStyle = '#94a3b8';
-    ctx.fillRect(x - 27, y - 34, 54, 1.5);
-
-    // Pedestal Emblem / Relief Crest
-    if (isDamage) {
-      // Miniature Crossed Swords Crest
-      ctx.fillStyle = isUnlocked ? '#fbbf24' : '#94a3b8';
+      // Divine Radiant Aura behind statue
+      const auraGrad = ctx.createRadialGradient(x, y - 65 + floatY, 8, x, y - 65 + floatY, 65);
+      auraGrad.addColorStop(0, isHealth ? 'rgba(52, 211, 153, 0.55)' : isDamage ? 'rgba(251, 191, 36, 0.55)' : 'rgba(59, 130, 246, 0.55)');
+      auraGrad.addColorStop(0.5, isHealth ? 'rgba(16, 185, 129, 0.2)' : isDamage ? 'rgba(245, 158, 11, 0.2)' : 'rgba(37, 99, 235, 0.2)');
+      auraGrad.addColorStop(1, 'rgba(0, 0, 0, 0)');
+      ctx.fillStyle = auraGrad;
       ctx.beginPath();
-      ctx.moveTo(x - 6, y - 27);
-      ctx.lineTo(x + 6, y - 23);
-      ctx.moveTo(x + 6, y - 27);
-      ctx.lineTo(x - 6, y - 23);
-      ctx.stroke();
-    } else if (isHealth) {
-      // Miniature Red Crescent Relief
-      ctx.fillStyle = isUnlocked ? '#ef4444' : '#e2e8f0';
-      ctx.beginPath();
-      ctx.arc(x, y - 25, 4, -0.6 * Math.PI, 0.6 * Math.PI, false);
-      ctx.arc(x + 1.6, y - 25, 3.2, 0.6 * Math.PI, -0.6 * Math.PI, true);
-      ctx.closePath();
+      ctx.arc(x, y - 65 + floatY, 65, 0, Math.PI * 2);
       ctx.fill();
-    } else if (isDefense) {
-      // Miniature Hammer Relief
-      ctx.fillStyle = isUnlocked ? '#fbbf24' : '#94a3b8';
-      ctx.fillRect(x - 4, y - 27, 8, 3);
-      ctx.fillRect(x - 1, y - 24, 2, 4);
+
+      // Rising sacred spark particles
+      for (let p = 0; p < 4; p++) {
+        const px = x + Math.sin(this.animTimer * 2.5 + p * 1.6) * 28;
+        const py = y - 35 - ((this.animTimer * 20 + p * 14) % 55);
+        ctx.fillStyle = isHealth ? '#a7f3d0' : isDamage ? '#fef08a' : '#93c5fd';
+        ctx.fillRect(px, py, 2, 2);
+      }
     }
 
-    // Coin sockets on pedestal body (2 rows of 4)
-    const startCx = x - 18;
-    for (let i = 0; i < maxCoins; i++) {
-      const cx = startCx + (i % 4) * 11 + 2;
-      const cy = y - 18 + Math.floor(i / 4) * 9;
+    // 1. Classical Stepped Stone Pedestal & Altar Foundation
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.6)';
+    ctx.beginPath();
+    ctx.ellipse(x, y, 54, 8, 0, 0, Math.PI * 2);
+    ctx.fill();
 
-      // Dark carved socket hole
-      ctx.fillStyle = '#1e293b';
+    // Step 1: Base slab
+    ctx.fillStyle = '#0f172a';
+    ctx.fillRect(x - 46, y - 4, 92, 4);
+    ctx.fillStyle = isUnlocked ? '#334155' : '#1e293b';
+    ctx.fillRect(x - 44, y - 9, 88, 5);
+
+    // Step 2: Mid altar plinth
+    ctx.fillStyle = isUnlocked ? '#475569' : '#1e293b';
+    ctx.fillRect(x - 36, y - 24, 72, 15);
+    ctx.fillStyle = isUnlocked ? '#64748b' : '#334155';
+    ctx.fillRect(x - 36, y - 24, 4, 15);
+    ctx.fillStyle = '#0f172a';
+    ctx.fillRect(x + 32, y - 24, 4, 15);
+
+    // Step 3: Top altar molding
+    ctx.fillStyle = isUnlocked ? '#475569' : '#334155';
+    ctx.fillRect(x - 38, y - 28, 76, 4);
+    ctx.fillStyle = isUnlocked ? '#94a3b8' : '#64748b';
+    ctx.fillRect(x - 37, y - 28, 74, 1.5);
+
+    // Pedestal Carved Inscription Plaque
+    ctx.fillStyle = '#020617';
+    ctx.fillRect(x - 30, y - 22, 60, 8);
+    ctx.strokeStyle = isUnlocked ? '#fbbf24' : '#64748b';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(x - 30, y - 22, 60, 8);
+
+    ctx.fillStyle = isUnlocked ? '#fef08a' : '#cbd5e1';
+    ctx.font = 'bold 6px "Cinzel", Georgia, serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    if (isDamage) {
+      ctx.fillText('57. ALAY & ATATÜRK ANITI', x, y - 18);
+    } else if (isHealth) {
+      ctx.fillText('HİLAL-İ AHMER HEMŞİRESİ', x, y - 18);
+    } else {
+      ctx.fillText('İSTİHKÂM & SAVUNMA ANITI', x, y - 18);
+    }
+
+    // Twin Brazier Sconces (Sol ve Sağ Meşale Sütunları)
+    for (const pSide of [-1, 1]) {
+      const px = x + pSide * 44;
+      ctx.fillStyle = isUnlocked ? '#334155' : '#1e293b';
+      ctx.fillRect(px - 3, y - 24, 6, 24);
+      ctx.fillStyle = isUnlocked ? '#64748b' : '#334155';
+      ctx.fillRect(px - 3, y - 24, 2, 24);
+
+      // Bronze Brazier Bowl
+      ctx.fillStyle = '#78350f';
+      ctx.fillRect(px - 6, y - 28, 12, 4);
+      ctx.fillStyle = isUnlocked ? '#fbbf24' : '#b45309';
+      ctx.fillRect(px - 5, y - 28, 10, 1.5);
+
+      if (isUnlocked) {
+        // Flickering holy flame
+        const fTime = this.animTimer * 8 + (pSide > 0 ? 3 : 0);
+        const fH = 10 + Math.sin(fTime) * 3;
+        ctx.fillStyle = isHealth ? '#10b981' : isDamage ? '#f59e0b' : '#38bdf8';
+        ctx.beginPath();
+        ctx.moveTo(px - 4, y - 28);
+        ctx.lineTo(px, y - 28 - fH);
+        ctx.lineTo(px + 4, y - 28);
+        ctx.closePath();
+        ctx.fill();
+        ctx.fillStyle = isHealth ? '#a7f3d0' : isDamage ? '#fef08a' : '#bae6fd';
+        ctx.fillRect(px - 1.5, y - 28 - fH * 0.55, 3, fH * 0.55);
+      }
+    }
+
+    // 2. MONUMENT STATUE SCULPTURE
+    const stX = x;
+    const stY = y - 28 + floatY;
+
+    if (isDamage) {
+      // =========================================================================
+      // 1. 57. ALAY & MUSTAFA KEMAL ATATÜRK ANITI
+      // (Şaha Kalkmış Asil At Üzerinde Kılıcını Çekmiş Gazi Mustafa Kemal)
+      // =========================================================================
+
+      // Atın Rüzgarda Savrulan Kuyruğu
+      ctx.fillStyle = isUnlocked ? '#475569' : '#1e293b';
       ctx.beginPath();
-      ctx.arc(cx, cy, 3.5, 0, Math.PI * 2);
+      ctx.moveTo(stX - 16, stY - 22);
+      ctx.quadraticCurveTo(stX - 26, stY - 14, stX - 22, stY - 2);
+      ctx.quadraticCurveTo(stX - 20, stY - 10, stX - 12, stY - 16);
+      ctx.closePath();
+      ctx.fill();
+
+      // Atın Arka Bacakları (Kaideye basan güçlü bacaklar)
+      ctx.fillStyle = isUnlocked ? '#334155' : '#1e293b';
+      // Sol Arka Bacak
+      ctx.beginPath();
+      ctx.moveTo(stX - 14, stY - 26);
+      ctx.lineTo(stX - 18, stY);
+      ctx.lineTo(stX - 12, stY);
+      ctx.lineTo(stX - 8, stY - 22);
+      ctx.closePath();
+      ctx.fill();
+      // Sağ Arka Bacak
+      ctx.beginPath();
+      ctx.moveTo(stX - 6, stY - 26);
+      ctx.lineTo(stX - 5, stY);
+      ctx.lineTo(stX + 1, stY);
+      ctx.lineTo(stX + 1, stY - 22);
+      ctx.closePath();
+      ctx.fill();
+
+      // Atın Şaha Kalkmış Gövdesi (Sağrı, Göğüs, Karın - 40 Derece Şaha Kalkık)
+      ctx.fillStyle = isUnlocked ? '#475569' : '#334155';
+      ctx.beginPath();
+      ctx.moveTo(stX - 16, stY - 28);
+      ctx.quadraticCurveTo(stX - 14, stY - 42, stX - 2, stY - 46); // Sırt
+      ctx.lineTo(stX + 14, stY - 54); // Göğüs üstü
+      ctx.lineTo(stX + 16, stY - 46); // Göğüs altı
+      ctx.quadraticCurveTo(stX + 6, stY - 36, stX - 4, stY - 28); // Karın
+      ctx.closePath();
+      ctx.fill();
+
+      // Atın Havada Şaha Kalkmış Ön Bacakları
+      ctx.fillStyle = isUnlocked ? '#64748b' : '#334155';
+      // Sol Ön Bacak (Havada bükük)
+      ctx.beginPath();
+      ctx.moveTo(stX + 10, stY - 48);
+      ctx.lineTo(stX + 18, stY - 56);
+      ctx.lineTo(stX + 22, stY - 48);
+      ctx.lineTo(stX + 18, stY - 46);
+      ctx.lineTo(stX + 14, stY - 50);
+      ctx.lineTo(stX + 8, stY - 44);
+      ctx.closePath();
+      ctx.fill();
+      // Sağ Ön Bacak (Daha ileri uzanmış)
+      ctx.beginPath();
+      ctx.moveTo(stX + 12, stY - 50);
+      ctx.lineTo(stX + 24, stY - 58);
+      ctx.lineTo(stX + 26, stY - 52);
+      ctx.lineTo(stX + 20, stY - 48);
+      ctx.closePath();
+      ctx.fill();
+
+      // Atın Başı, Boynu ve Kulakları
+      ctx.fillStyle = isUnlocked ? '#64748b' : '#475569';
+      ctx.beginPath();
+      ctx.moveTo(stX + 6, stY - 50);
+      ctx.lineTo(stX + 13, stY - 68); // Boyun arkası
+      ctx.lineTo(stX + 16, stY - 72); // Kulak
+      ctx.lineTo(stX + 22, stY - 64); // Burun
+      ctx.lineTo(stX + 16, stY - 56); // Çene
+      ctx.closePath();
+      ctx.fill();
+
+      // Yele ve Dizgin
+      ctx.fillStyle = isUnlocked ? '#fbbf24' : '#64748b';
+      ctx.fillRect(stX + 8, stY - 62, 4, 10);
+      ctx.strokeStyle = isUnlocked ? '#fbbf24' : '#94a3b8';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(stX + 19, stY - 62);
+      ctx.lineTo(stX + 2, stY - 50);
+      ctx.stroke();
+
+      // --- GAZİ MUSTAFA KEMAL ATATÜRK ---
+      // Çizmeler & Eyer
+      ctx.fillStyle = isUnlocked ? '#1e293b' : '#0f172a';
+      ctx.fillRect(stX - 4, stY - 38, 6, 12);
+      ctx.fillStyle = isUnlocked ? '#fbbf24' : '#475569';
+      ctx.fillRect(stX - 5, stY - 28, 3, 2); // Mahmuz
+
+      // Rüzgarda Uçuşan Subay Pelerini
+      ctx.fillStyle = isUnlocked ? '#b91c1c' : '#450a0a';
+      ctx.beginPath();
+      ctx.moveTo(stX - 4, stY - 56);
+      ctx.quadraticCurveTo(stX - 20, stY - 54, stX - 24, stY - 36);
+      ctx.quadraticCurveTo(stX - 14, stY - 44, stX - 4, stY - 42);
+      ctx.closePath();
+      ctx.fill();
+
+      // Üniforma Gövdesi & Palaska
+      ctx.fillStyle = isUnlocked ? '#64748b' : '#475569';
+      ctx.fillRect(stX - 4, stY - 56, 10, 16);
+      ctx.fillStyle = isUnlocked ? '#fbbf24' : '#334155';
+      ctx.fillRect(stX - 4, stY - 45, 10, 3); // Kemer
+      ctx.fillStyle = isUnlocked ? '#fef08a' : '#94a3b8';
+      ctx.fillRect(stX, stY - 46, 3, 5); // Toka
+
+      // Omuz Apoletleri
+      ctx.fillStyle = isUnlocked ? '#fbbf24' : '#64748b';
+      ctx.fillRect(stX - 6, stY - 58, 4, 3);
+      ctx.fillRect(stX + 3, stY - 58, 4, 3);
+
+      // Baş & Karakteristik Subay Kalpağı
+      ctx.fillStyle = isUnlocked ? '#cbd5e1' : '#64748b';
+      ctx.fillRect(stX - 2, stY - 68, 8, 10); // Yüz
+      ctx.fillStyle = isUnlocked ? '#475569' : '#1e293b';
+      ctx.fillRect(stX - 4, stY - 78, 12, 11); // Kalpak
+      ctx.fillStyle = isUnlocked ? '#fbbf24' : '#64748b';
+      ctx.fillRect(stX - 5, stY - 69, 14, 2.5); // Siperlik
+      // Hilal kokart
+      ctx.fillStyle = isUnlocked ? '#fef08a' : '#cbd5e1';
+      ctx.beginPath();
+      ctx.arc(stX + 2, stY - 73, 1.8, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Sol El (Dizgini tutan)
+      ctx.fillStyle = isUnlocked ? '#64748b' : '#475569';
+      ctx.fillRect(stX, stY - 52, 4, 6);
+
+      // SAĞ KOL VE İLERİYE DOĞRULTULMUŞ GAZİ KILICI
+      ctx.fillStyle = isUnlocked ? '#94a3b8' : '#64748b';
+      ctx.beginPath();
+      ctx.moveTo(stX + 4, stY - 54);
+      ctx.lineTo(stX + 15, stY - 62);
+      ctx.lineTo(stX + 17, stY - 58);
+      ctx.lineTo(stX + 6, stY - 50);
+      ctx.closePath();
+      ctx.fill();
+
+      // Kılıç Kabzası
+      ctx.fillStyle = isUnlocked ? '#fbbf24' : '#94a3b8';
+      ctx.fillRect(stX + 14, stY - 64, 5, 4);
+
+      // Parlayan Çelik Kılıç Namlusu (İleri ve Yukarı Doğru)
+      ctx.strokeStyle = isUnlocked ? '#ffffff' : '#cbd5e1';
+      ctx.lineWidth = 2.4;
+      ctx.beginPath();
+      ctx.moveTo(stX + 17, stY - 63);
+      ctx.lineTo(stX + 36, stY - 80);
+      ctx.stroke();
+
+      ctx.strokeStyle = isUnlocked ? '#fbbf24' : '#64748b';
+      ctx.lineWidth = 0.8;
+      ctx.beginPath();
+      ctx.moveTo(stX + 17, stY - 63);
+      ctx.lineTo(stX + 36, stY - 80);
+      ctx.stroke();
+
+    } else if (isHealth) {
+      // =========================================================================
+      // 2. HİLAL-İ AHMER ŞİFA ANITI
+      // (Başında Hilal Olan Merhametli Türk Hemşiresi & Şifa Feneri)
+      // =========================================================================
+
+      // Mermer Şifa Kaidesi ve Arka Sütunlar
+      ctx.fillStyle = isUnlocked ? '#f8fafc' : '#334155';
+      ctx.fillRect(stX - 22, stY - 62, 5, 62);
+      ctx.fillRect(stX + 17, stY - 62, 5, 62);
+      ctx.fillStyle = isUnlocked ? '#e2e8f0' : '#1e293b';
+      ctx.fillRect(stX - 24, stY - 66, 48, 5);
+
+      // Defne / Zeytin Dalı Barış Çelengi
+      ctx.fillStyle = isUnlocked ? '#16a34a' : '#14532d';
+      ctx.beginPath();
+      ctx.arc(stX, stY - 46, 20, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = isUnlocked ? '#020617' : '#0f172a';
+      ctx.beginPath();
+      ctx.arc(stX, stY - 46, 14, 0, Math.PI * 2);
+      ctx.fill();
+
+      // MERHAMETLİ HİLAL-İ AHMER HEMŞİRESİ HEYKELİ
+      // Uzun Beyaz Dökümlü Hemşire Elbisesi & Önlüğü
+      ctx.fillStyle = isUnlocked ? '#f1f5f9' : '#475569';
+      ctx.beginPath();
+      ctx.moveTo(stX - 8, stY - 48);
+      ctx.lineTo(stX - 14, stY);
+      ctx.lineTo(stX + 14, stY);
+      ctx.lineTo(stX + 8, stY - 48);
+      ctx.closePath();
+      ctx.fill();
+
+      // Göğüste Hilal-i Ahmer Kırmızı Hilal Rozeti
+      ctx.fillStyle = '#ef4444';
+      ctx.beginPath();
+      ctx.arc(stX, stY - 40, 4.5, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = isUnlocked ? '#f1f5f9' : '#475569';
+      ctx.beginPath();
+      ctx.arc(stX + 1.8, stY - 40, 3.8, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Hemşire Başı & Asil Yüzü
+      ctx.fillStyle = isUnlocked ? '#cbd5e1' : '#64748b';
+      ctx.fillRect(stX - 4.5, stY - 62, 9, 12);
+
+      // Başındaki Beyaz Hemşire Başlığı / Örtüsü & Kepi
+      ctx.fillStyle = isUnlocked ? '#ffffff' : '#94a3b8';
+      ctx.beginPath();
+      ctx.moveTo(stX - 8, stY - 52);
+      ctx.lineTo(stX - 7, stY - 68);
+      ctx.lineTo(stX + 7, stY - 68);
+      ctx.lineTo(stX + 8, stY - 52);
+      ctx.closePath();
+      ctx.fill();
+
+      // BAŞINDAKİ KUTSAL HİLAL SİMGESİ (Hilal-i Ahmer Başlığı)
+      ctx.fillStyle = isUnlocked ? '#ef4444' : '#b91c1c';
+      ctx.beginPath();
+      ctx.arc(stX, stY - 63, 3.5, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = isUnlocked ? '#ffffff' : '#94a3b8';
+      ctx.beginPath();
+      ctx.arc(stX + 1.2, stY - 63, 3.0, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Sol Elinde Tuttuğu Hilal-i Ahmer Şifa Feneri / Lambası
+      ctx.fillStyle = isUnlocked ? '#64748b' : '#334155';
+      ctx.fillRect(stX - 14, stY - 36, 4, 16); // Kol
+      // Bronz Fener Gövdesi
+      ctx.fillStyle = isUnlocked ? '#fbbf24' : '#b45309';
+      ctx.fillRect(stX - 17, stY - 24, 8, 10);
+      ctx.fillStyle = isUnlocked ? '#fef08a' : '#cbd5e1';
+      ctx.fillRect(stX - 15.5, stY - 22, 5, 6); // Fener Camı ve Işığı
+      if (isUnlocked) {
+        // Fener parıltısı
+        ctx.fillStyle = 'rgba(52, 211, 153, 0.6)';
+        ctx.beginPath();
+        ctx.arc(stX - 13, stY - 19, 8, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      // Sağ Eli (Şefkatle Göğsünde)
+      ctx.fillStyle = isUnlocked ? '#cbd5e1' : '#64748b';
+      ctx.fillRect(stX + 1, stY - 36, 6, 5);
+
+    } else {
+      // =========================================================================
+      // 3. ÇANAKKALE İSTİHKAM & SAVUNMA ANITI
+      // (Elinde Çekiç/Balyoz ve Siper Kazma/Küreği Tutan İstihkamcı Mehmetçik)
+      // =========================================================================
+
+      // Siper Kum Torbaları ve Tahkimat Kütükleri Kaidesi
+      ctx.fillStyle = isUnlocked ? '#475569' : '#1e293b';
+      ctx.fillRect(stX - 24, stY - 14, 48, 14);
+      ctx.fillStyle = isUnlocked ? '#64748b' : '#334155';
+      ctx.fillRect(stX - 22, stY - 12, 14, 6);
+      ctx.fillRect(stX + 8, stY - 12, 14, 6);
+
+      // İSTİHKAMCI MEHMETÇİK HEYKELİ
+      // Bacaklar & Sağlam Asker Postalları
+      ctx.fillStyle = isUnlocked ? '#334155' : '#1e293b';
+      ctx.fillRect(stX - 10, stY - 28, 7, 28);
+      ctx.fillRect(stX + 3, stY - 28, 7, 28);
+      ctx.fillStyle = isUnlocked ? '#1e293b' : '#0f172a';
+      ctx.fillRect(stX - 11, stY - 8, 8, 8);
+      ctx.fillRect(stX + 3, stY - 8, 8, 8);
+
+      // Güçlü Üniforma Gövdesi, Deri İstihkam Palaskası & Yeleği
+      ctx.fillStyle = isUnlocked ? '#64748b' : '#475569';
+      ctx.fillRect(stX - 11, stY - 56, 22, 30);
+      ctx.fillStyle = isUnlocked ? '#78350f' : '#451a03';
+      ctx.fillRect(stX - 10, stY - 34, 20, 4); // Deri Takım Kemeri
+      ctx.fillStyle = isUnlocked ? '#fbbf24' : '#94a3b8';
+      ctx.fillRect(stX - 2, stY - 35, 4, 6); // Toka
+
+      // Mehmetçik Başı & Kabalak / Kalpak
+      ctx.fillStyle = isUnlocked ? '#cbd5e1' : '#64748b';
+      ctx.fillRect(stX - 5.5, stY - 70, 11, 14);
+      ctx.fillStyle = isUnlocked ? '#475569' : '#1e293b';
+      ctx.fillRect(stX - 7, stY - 80, 14, 11);
+      ctx.fillStyle = isUnlocked ? '#fbbf24' : '#64748b';
+      ctx.fillRect(stX - 8, stY - 71, 16, 2.5);
+
+      // SOL EL: OMZUNA DAYALI DEV İSTİHKAM ÇEKİCİ / BALYOZU (SLEDGEHAMMER)
+      // Çekiç Ahşap Sapı
+      ctx.fillStyle = '#78350f';
+      ctx.fillRect(stX - 17, stY - 74, 4, 60);
+      ctx.fillStyle = isUnlocked ? '#fbbf24' : '#94a3b8';
+      ctx.fillRect(stX - 17.5, stY - 48, 5, 3); // Metal takviye halkası
+      // Ağır Dövme Çelik Çekiç Başı
+      ctx.fillStyle = isUnlocked ? '#fbbf24' : '#64748b';
+      ctx.fillRect(stX - 24, stY - 78, 18, 12);
+      ctx.fillStyle = '#0f172a';
+      ctx.fillRect(stX - 18, stY - 79, 6, 14);
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(stX - 24, stY - 78, 3, 12);
+      ctx.fillRect(stX - 9, stY - 78, 3, 12);
+
+      // Sol Kol (Çekici Kavrayan Güçlü Kol)
+      ctx.fillStyle = isUnlocked ? '#94a3b8' : '#475569';
+      ctx.fillRect(stX - 15, stY - 54, 8, 18);
+
+      // SAĞ EL: YERE SAPLANMIŞ SİPER KAZMA / KÜREĞİ (TRENCH SHOVEL & MATTOCK)
+      // Kürek Sapı
+      ctx.fillStyle = '#92400e';
+      ctx.fillRect(stX + 13, stY - 52, 3.5, 52);
+      // Kürek Kabzası (T tutamak)
+      ctx.fillStyle = isUnlocked ? '#fbbf24' : '#64748b';
+      ctx.fillRect(stX + 11, stY - 54, 7.5, 3);
+      // Sivri Çelik Kürek Ağzı / Kazma Ucu (Yere saplanmış)
+      ctx.fillStyle = isUnlocked ? '#cbd5e1' : '#64748b';
+      ctx.beginPath();
+      ctx.moveTo(stX + 10, stY - 14);
+      ctx.lineTo(stX + 19, stY - 14);
+      ctx.lineTo(stX + 15, stY);
+      ctx.closePath();
+      ctx.fill();
+
+      // Sağ Kol (Küreğin T-Kabzasını Tutan Kol)
+      ctx.fillStyle = isUnlocked ? '#94a3b8' : '#475569';
+      ctx.fillRect(stX + 7, stY - 54, 8, 14);
+
+      // Siper Savunma Kalkanı Rölyefi (Önde)
+      ctx.fillStyle = isUnlocked ? '#fbbf24' : '#334155';
+      ctx.beginPath();
+      ctx.moveTo(stX - 6, stY - 28);
+      ctx.lineTo(stX + 6, stY - 28);
+      ctx.lineTo(stX + 6, stY - 12);
+      ctx.lineTo(stX, stY - 6);
+      ctx.lineTo(stX - 6, stY - 12);
+      ctx.closePath();
+      ctx.fill();
+    }
+
+    // 8 Coin Sockets on Altar
+    const socketStartX = x - 18;
+    for (let i = 0; i < maxCoins; i++) {
+      const sx = socketStartX + (i % 4) * 12;
+      const sy = y - 14 + Math.floor(i / 4) * 6;
+
+      ctx.fillStyle = '#020617';
+      ctx.beginPath();
+      ctx.arc(sx, sy, 2.4, 0, Math.PI * 2);
       ctx.fill();
 
       if (i < coins || isUnlocked) {
-        // Gleaming gold coin
         ctx.fillStyle = '#f59e0b';
         ctx.beginPath();
-        ctx.arc(cx, cy, 3, 0, Math.PI * 2);
+        ctx.arc(sx, sy, 2.0, 0, Math.PI * 2);
         ctx.fill();
         ctx.fillStyle = '#fef08a';
         ctx.beginPath();
-        ctx.arc(cx - 0.7, cy - 0.7, 1.8, 0, Math.PI * 2);
+        ctx.arc(sx - 0.5, sy - 0.5, 1.0, 0, Math.PI * 2);
         ctx.fill();
       } else {
-        // Subtle socket rim
-        ctx.strokeStyle = '#334155';
-        ctx.lineWidth = 1;
+        ctx.strokeStyle = '#475569';
+        ctx.lineWidth = 0.8;
         ctx.beginPath();
-        ctx.arc(cx, cy, 3.5, 0, Math.PI * 2);
+        ctx.arc(sx, sy, 2.4, 0, Math.PI * 2);
         ctx.stroke();
       }
-    }
-
-    // 2. Monument Body (Stele + Sculpted Figures)
-    ctx.translate(x, y - 34);
-
-    // Divine Levitation Float when unlocked
-    let floatY = 0;
-    if (isUnlocked) {
-      floatY = Math.sin(this.animTimer * 2.5) * 4;
-      ctx.translate(0, floatY);
-
-      // Celestial Aura Radial Glow
-      const auraGrad = ctx.createRadialGradient(0, -42, 4, 0, -42, 48);
-      auraGrad.addColorStop(0, 'rgba(251, 191, 36, 0.45)');
-      auraGrad.addColorStop(0.6, 'rgba(251, 191, 36, 0.15)');
-      auraGrad.addColorStop(1, 'rgba(251, 191, 36, 0)');
-      ctx.fillStyle = auraGrad;
-      ctx.beginPath();
-      ctx.arc(0, -42, 48, 0, Math.PI * 2);
-      ctx.fill();
-
-      // Floating blessing dust motes
-      for (let m = 0; m < 3; m++) {
-        const mx = Math.sin(this.animTimer * 2 + m * 2.1) * 26;
-        const my = -30 - ((this.animTimer * 20 + m * 18) % 45);
-        ctx.fillStyle = '#fef08a';
-        ctx.fillRect(mx, my, 2, 2);
-      }
-    }
-
-    // Architectural Monument Backing Stele (Arched Stele)
-    // Ensures the statue stands out clearly and boldly against any terrain or sky!
-    ctx.fillStyle = isUnlocked ? '#334155' : '#1e293b';
-    ctx.beginPath();
-    ctx.moveTo(-24, 0);
-    ctx.lineTo(-24, -58);
-    ctx.bezierCurveTo(-24, -78, 24, -78, 24, -58);
-    ctx.lineTo(24, 0);
-    ctx.closePath();
-    ctx.fill();
-
-    // Ornate Stele Inscribed Inner Frame
-    ctx.strokeStyle = isUnlocked ? '#fbbf24' : '#475569';
-    ctx.lineWidth = 1.8;
-    ctx.beginPath();
-    ctx.moveTo(-21, 0);
-    ctx.lineTo(-21, -56);
-    ctx.bezierCurveTo(-21, -74, 21, -74, 21, -56);
-    ctx.lineTo(21, 0);
-    ctx.stroke();
-
-    // Classical Marble Colors
-    const stoneBase = isUnlocked ? '#f8fafc' : '#cbd5e1';
-    const stoneShadow = isUnlocked ? '#94a3b8' : '#64748b';
-    const stoneDark = isUnlocked ? '#475569' : '#334155';
-    const stoneHighlight = isUnlocked ? '#ffffff' : '#f1f5f9';
-    const goldTrim = isUnlocked ? '#fbbf24' : '#e2e8f0';
-
-    if (isDamage) {
-      // =========================================================================
-      // 1. ŞÜHEDA SANCAĞI YADİGARI - ATATÜRK'ÜN ŞAHA KALKMIŞ AT ÜZERİNDE KILIÇLI HEYKELİ
-      // =========================================================================
-      // Background Red Ottoman & Turkish Crescent Flag (Şüheda Sancağı)
-      ctx.fillStyle = isUnlocked ? '#dc2626' : '#991b1b';
-      ctx.beginPath();
-      ctx.moveTo(-18, -78);
-      ctx.lineTo(8, -70);
-      ctx.lineTo(-18, -62);
-      ctx.closePath();
-      ctx.fill();
-      ctx.fillStyle = '#f8fafc';
-      ctx.beginPath();
-      ctx.arc(-10, -70, 2.8, 0, Math.PI * 2);
-      ctx.fill();
-
-      // --- REARING BRONZE WAR HORSE (Şaha Kalkmış Süvari Atı) ---
-      // Rear legs planted firmly on pedestal base
-      ctx.fillStyle = stoneDark;
-      ctx.fillRect(-12, -12, 6, 12);
-      ctx.fillRect(-4, -10, 6, 10);
-
-      // Angled Rearing Body of Horse
-      ctx.save();
-      ctx.rotate(-0.35); // 20-degree upward rearing angle
-
-      // Muscle Barrel & Chest
-      ctx.fillStyle = stoneShadow;
-      ctx.beginPath();
-      ctx.ellipse(-4, -22, 12, 18, 0.4, 0, Math.PI * 2);
-      ctx.fill();
-
-      // Powerful Arched Neck & Head
-      ctx.beginPath();
-      ctx.moveTo(-8, -32);
-      ctx.lineTo(-4, -48);
-      ctx.lineTo(4, -46);
-      ctx.lineTo(2, -28);
-      ctx.closePath();
-      ctx.fill();
-
-      // Horse Head & Muzzle
-      ctx.beginPath();
-      ctx.ellipse(-2, -50, 5, 8, -0.3, 0, Math.PI * 2);
-      ctx.fill();
-
-      // Rearing Front Legs raised in mid-air!
-      ctx.strokeStyle = stoneShadow;
-      ctx.lineWidth = 4;
-      ctx.beginPath();
-      ctx.moveTo(2, -34);
-      ctx.lineTo(14, -44);
-      ctx.lineTo(12, -54); // Hoof raised
-      ctx.moveTo(-2, -32);
-      ctx.lineTo(8, -40);
-      ctx.lineTo(6, -50);
-      ctx.stroke();
-
-      ctx.restore();
-
-      // --- MAREŞAL GAZI MUSTAFA KEMAL ATATÜRK (Süvari Üniforması & Pelerin) ---
-      // Saddle & Cloak
-      ctx.fillStyle = isUnlocked ? '#1e293b' : stoneDark;
-      ctx.fillRect(-8, -26, 14, 10);
-
-      // Atatürk's Torso & Tunic
-      ctx.fillStyle = stoneBase;
-      ctx.fillRect(-6, -42, 12, 16);
-
-      // Flowing Officer's Cloak / Pelerin
-      ctx.fillStyle = isUnlocked ? '#334155' : stoneShadow;
-      ctx.beginPath();
-      ctx.moveTo(-8, -42);
-      ctx.lineTo(-20, -32);
-      ctx.lineTo(-18, -20);
-      ctx.lineTo(-6, -28);
-      ctx.closePath();
-      ctx.fill();
-
-      // Atatürk Head & Kalpak (Kuvayımilliye Kalpağı)
-      ctx.fillStyle = stoneBase;
-      ctx.fillRect(-4, -50, 8, 8); // Face
-      ctx.fillStyle = stoneDark;
-      ctx.fillRect(-5, -58, 10, 8); // Ottoman Kalpak
-      ctx.fillRect(-6, -52, 12, 2.5); // Rim
-
-      // Raised Arm holding the Ottoman Curved Officer Sword (Gök Yönlü Kavisli Subay Şemşiri)
-      ctx.strokeStyle = stoneBase;
-      ctx.lineWidth = 3.5;
-      ctx.beginPath();
-      ctx.moveTo(3, -40);
-      ctx.lineTo(12, -52);
-      ctx.stroke();
-
-      // Curved Sword Blade pointing skywards
-      const bladeColor = isUnlocked ? '#fef08a' : stoneHighlight;
-      ctx.fillStyle = bladeColor;
-      ctx.beginPath();
-      ctx.moveTo(11, -53);
-      ctx.bezierCurveTo(14, -65, 18, -78, 24, -86); // Sweeping curve up
-      ctx.lineTo(21, -85);
-      ctx.bezierCurveTo(16, -75, 12, -63, 10, -53);
-      ctx.closePath();
-      ctx.fill();
-
-      // Gold Crossguard
-      ctx.fillStyle = goldTrim;
-      ctx.fillRect(8, -54, 8, 3);
-
-    } else if (isHealth) {
-      // ====================================================
-      // 2. HİLAL HEYKELİ (Elinde Hilal Tutan Asker Hemşiresi)
-      // ====================================================
-      // Flowing Classical Nurse Gown / Robe
-      ctx.fillStyle = stoneShadow;
-      ctx.beginPath();
-      ctx.moveTo(-13, 0);
-      ctx.lineTo(-9, -24);
-      ctx.lineTo(9, -24);
-      ctx.lineTo(13, 0);
-      ctx.closePath();
-      ctx.fill();
-
-      // Pure White Marble Apron & Drapery Pleats
-      ctx.fillStyle = stoneBase;
-      ctx.beginPath();
-      ctx.moveTo(-9, 0);
-      ctx.lineTo(-7, -24);
-      ctx.lineTo(7, -24);
-      ctx.lineTo(9, 0);
-      ctx.closePath();
-      ctx.fill();
-
-      ctx.strokeStyle = stoneHighlight;
-      ctx.lineWidth = 1.2;
-      ctx.beginPath();
-      ctx.moveTo(-4, 0);
-      ctx.lineTo(-3, -22);
-      ctx.moveTo(4, 0);
-      ctx.lineTo(3, -22);
-      ctx.stroke();
-
-      // Torso & Bold Red Crescent (Hilal-i Ahmer) Emblem
-      ctx.fillStyle = stoneBase;
-      ctx.fillRect(-8, -36, 16, 13);
-      // Vivid Red Crescent on chest
-      ctx.fillStyle = isUnlocked ? '#ef4444' : '#dc2626';
-      ctx.beginPath();
-      ctx.arc(0, -30, 4.2, -0.65 * Math.PI, 0.65 * Math.PI, false);
-      ctx.arc(1.5, -30, 3.2, 0.65 * Math.PI, -0.65 * Math.PI, true);
-      ctx.closePath();
-      ctx.fill();
-
-      // Head & Flowing Nurse Headscarf (Hemşire Başörtüsü)
-      ctx.fillStyle = stoneShadow;
-      ctx.fillRect(-3, -39, 6, 4); // Neck
-      ctx.fillStyle = stoneBase;
-      ctx.fillRect(-6, -48, 12, 10); // Serene face
-      ctx.fillStyle = isUnlocked ? '#fbbf24' : stoneDark;
-      ctx.fillRect(-3.5, -45, 2, 2); // Eyes
-      ctx.fillRect(1.5, -45, 2, 2);
-
-      // Flowing Veil draped gracefully over head and shoulders
-      ctx.fillStyle = stoneHighlight;
-      ctx.beginPath();
-      ctx.moveTo(-8, -26);
-      ctx.lineTo(-8, -52);
-      ctx.bezierCurveTo(-8, -56, 8, -56, 8, -52);
-      ctx.lineTo(8, -26);
-      ctx.lineTo(5, -26);
-      ctx.lineTo(4, -40);
-      ctx.lineTo(-4, -40);
-      ctx.lineTo(-5, -26);
-      ctx.closePath();
-      ctx.fill();
-
-      // Outstretched Arms raised high holding the sacred Hilal aloft
-      ctx.strokeStyle = stoneBase;
-      ctx.lineWidth = 3.5;
-      ctx.beginPath();
-      ctx.moveTo(-8, -34);
-      ctx.lineTo(-4, -48);
-      ctx.moveTo(8, -34);
-      ctx.lineTo(4, -48);
-      ctx.stroke();
-
-      // Hands grasping the crescent base
-      ctx.fillStyle = stoneHighlight;
-      ctx.fillRect(-5.5, -49, 3.5, 3.5);
-      ctx.fillRect(2, -49, 3.5, 3.5);
-
-      // THE SACRED HILAL (Göğe Kaldırılan Büyük Kutsal Hilal & Yıldız)
-      const moonX = 0;
-      const moonY = -56;
-      const moonRadius = 14;
-
-      // Radiant Crescent Moon
-      ctx.fillStyle = isUnlocked ? '#fef08a' : goldTrim;
-      ctx.beginPath();
-      ctx.arc(moonX, moonY, moonRadius, -0.72 * Math.PI, 0.72 * Math.PI, false);
-      ctx.arc(moonX + 4.5, moonY, moonRadius * 0.78, 0.72 * Math.PI, -0.72 * Math.PI, true);
-      ctx.closePath();
-      ctx.fill();
-
-      // Shining Five-Pointed Star inside the crescent
-      ctx.fillStyle = isUnlocked ? '#ffffff' : stoneHighlight;
-      ctx.beginPath();
-      ctx.arc(moonX + 4.5, moonY, 3, 0, Math.PI * 2);
-      ctx.fill();
-
-      if (isUnlocked) {
-        ctx.strokeStyle = '#ffffff';
-        ctx.lineWidth = 1.2;
-        ctx.stroke();
-      }
-
-    } else if (isDefense) {
-      // ==========================================================
-      // 3. ÇEKİÇ HEYKELİ (Elinde Balyoz Tutan İstihkam Mehmetçiği)
-      // ==========================================================
-      // Heavy Combat Sapper Boots & Sturdy Legs
-      ctx.fillStyle = stoneDark;
-      ctx.fillRect(-10, -10, 8, 10);
-      ctx.fillRect(3, -10, 8, 10);
-      ctx.fillStyle = stoneShadow;
-      ctx.fillRect(-9, -20, 6, 11);
-      ctx.fillRect(4, -20, 6, 11);
-
-      // Muscular Sapper Torso, Tough Apron & Heavy Tool Belt
-      ctx.fillStyle = stoneBase;
-      ctx.fillRect(-12, -39, 24, 20);
-      // Leather sapper breastplate apron
-      ctx.fillStyle = stoneDark;
-      ctx.fillRect(-7, -35, 14, 15);
-      // Heavy engineer belt with golden brass buckle
-      ctx.fillRect(-12, -24, 24, 4.5);
-      ctx.fillStyle = goldTrim;
-      ctx.fillRect(-2, -24, 4, 4.5);
-      // Sapper spikes & pouches
-      ctx.fillStyle = stoneShadow;
-      ctx.fillRect(-11, -27, 4, 6);
-      ctx.fillRect(7, -27, 4, 6);
-
-      // Mehmetçik Head & Proud Moustache
-      ctx.fillStyle = stoneShadow;
-      ctx.fillRect(-3, -42, 6, 4); // Neck
-      ctx.fillStyle = stoneBase;
-      ctx.fillRect(-7, -54, 14, 12); // Face
-      ctx.fillStyle = isUnlocked ? '#fbbf24' : stoneDark;
-      ctx.fillRect(-4.5, -50, 2.5, 2.5); // Eyes
-      ctx.fillRect(2, -50, 2.5, 2.5);
-      // Bold Ottoman Moustache
-      ctx.fillStyle = stoneDark;
-      ctx.fillRect(-6, -46, 12, 3.5);
-
-      // Ottoman Kabalak Helmet
-      ctx.fillStyle = stoneShadow;
-      ctx.beginPath();
-      ctx.moveTo(-10, -54);
-      ctx.lineTo(0, -66);
-      ctx.lineTo(10, -54);
-      ctx.closePath();
-      ctx.fill();
-      ctx.strokeStyle = stoneHighlight;
-      ctx.lineWidth = 1.4;
-      ctx.beginPath();
-      ctx.moveTo(-9, -56);
-      ctx.lineTo(9, -56);
-      ctx.stroke();
-      ctx.fillStyle = isUnlocked ? '#ef4444' : stoneDark;
-      ctx.beginPath();
-      ctx.arc(0, -59, 2.5, 0, Math.PI * 2);
-      ctx.fill();
-
-      // --- THE GIANT SLEDGEHAMMER (Büyük Ağır İstihkam Balyozu / Çekiç) ---
-      // Heavy square hammerhead perched high on ashwood shaft
-      const hX = 10;
-      const hTopY = -66;
-
-      // Long Ashwood Reinforced Handle
-      ctx.fillStyle = stoneDark;
-      ctx.fillRect(hX - 2, hTopY + 8, 4, 58);
-      // Iron reinforcement bands
-      ctx.fillStyle = isUnlocked ? '#fbbf24' : stoneShadow;
-      ctx.fillRect(hX - 2.5, hTopY + 16, 5, 2);
-      ctx.fillRect(hX - 2.5, hTopY + 32, 5, 2);
-
-      // GIANT SQUARE FORGED IRON SLEDGEHAMMER HEAD
-      ctx.fillStyle = isUnlocked ? '#fbbf24' : stoneBase;
-      ctx.fillRect(hX - 12, hTopY, 24, 15);
-      // Twin hardened silver strike faces
-      ctx.fillStyle = isUnlocked ? '#fef08a' : stoneHighlight;
-      ctx.fillRect(hX - 12, hTopY, 4, 15);
-      ctx.fillRect(hX + 8, hTopY, 4, 15);
-      // Center forged iron collar & wedges
-      ctx.fillStyle = stoneDark;
-      ctx.fillRect(hX - 4, hTopY - 2, 8, 19);
-      // Golden bolt heads
-      ctx.fillStyle = goldTrim;
-      ctx.fillRect(hX - 8, hTopY + 3, 2.5, 2.5);
-      ctx.fillRect(hX + 5.5, hTopY + 3, 2.5, 2.5);
-
-      // Strong Sapper Arms & Hands gripping the hammer handle with two hands
-      ctx.strokeStyle = stoneShadow;
-      ctx.lineWidth = 3.8;
-      ctx.beginPath();
-      ctx.moveTo(-10, -36);
-      ctx.lineTo(hX - 2, -26);
-      ctx.moveTo(10, -36);
-      ctx.lineTo(hX - 1, -44);
-      ctx.stroke();
-
-      // Hands with rolled-up sleeves
-      ctx.fillStyle = stoneBase;
-      ctx.fillRect(hX - 5, -46, 8, 5);
-      ctx.fillRect(hX - 5, -28, 8, 5);
     }
 
     ctx.restore();
@@ -6422,50 +7512,54 @@ export class GameRenderer {
       if (sx < -40 || sx > this.width + 40) continue;
 
       const sy = coin.y || gY - 4;
-      const spin = Math.abs(Math.cos(this.animTimer * 8 + coin.x * 0.1));
-      const coinWidth = Math.max(2, 6 * spin);
+      const spin = Math.abs(Math.cos(this.animTimer * 7 + coin.x * 0.1));
+      const coinWidth = Math.max(3.2, 6.5 * spin);
 
       ctx.save();
       ctx.translate(sx, sy);
 
       // Subtle shadow beneath coin
-      ctx.fillStyle = 'rgba(0, 0, 0, 0.35)';
+      ctx.fillStyle = 'rgba(0, 0, 0, 0.4)';
       ctx.beginPath();
-      ctx.ellipse(0, 4, 5, 2, 0, 0, Math.PI * 2);
+      ctx.ellipse(0, 4, 6, 2.2, 0, 0, Math.PI * 2);
       ctx.fill();
 
-      // Golden halo aura
-      const aura = ctx.createRadialGradient(0, 0, 1, 0, 0, 9);
-      aura.addColorStop(0, 'rgba(250, 204, 21, 0.45)');
-      aura.addColorStop(1, 'rgba(250, 204, 21, 0)');
+      // Golden halo aura (Sarı sikke ışıltısı)
+      const aura = ctx.createRadialGradient(0, 0, 1, 0, 0, 11);
+      aura.addColorStop(0, 'rgba(254, 240, 138, 0.65)');
+      aura.addColorStop(0.5, 'rgba(250, 204, 21, 0.35)');
+      aura.addColorStop(1, 'rgba(234, 179, 8, 0)');
       ctx.fillStyle = aura;
       ctx.beginPath();
-      ctx.arc(0, 0, 9, 0, Math.PI * 2);
+      ctx.arc(0, 0, 11, 0, Math.PI * 2);
       ctx.fill();
 
-      // Golden coin disc (spinning)
-      ctx.fillStyle = '#eab308';
+      // Radiant Yellow Coin Disc (Sarı Sikke)
+      ctx.fillStyle = '#facc15';
       ctx.beginPath();
-      ctx.ellipse(0, 0, coinWidth, 6, 0, 0, Math.PI * 2);
+      ctx.ellipse(0, 0, coinWidth, 6.2, 0, 0, Math.PI * 2);
       ctx.fill();
 
-      // Shining rim
+      // Shining bright gold rim
       ctx.strokeStyle = '#fef08a';
-      ctx.lineWidth = 1;
+      ctx.lineWidth = 1.2;
       ctx.stroke();
 
-      // Inner embossed detail
-      if (spin > 0.5) {
-        ctx.fillStyle = '#ca8a04';
+      // Inner embossed detail (Mecidiye tuğrası / hilal)
+      if (spin > 0.45) {
+        ctx.fillStyle = '#eab308';
         ctx.beginPath();
-        ctx.ellipse(0, 0, coinWidth * 0.55, 3.5, 0, 0, Math.PI * 2);
+        ctx.ellipse(0, 0, coinWidth * 0.65, 4.0, 0, 0, Math.PI * 2);
         ctx.fill();
+        ctx.strokeStyle = '#ca8a04';
+        ctx.lineWidth = 0.8;
+        ctx.stroke();
       }
 
-      // Specular sparkle
-      if (Math.sin(this.animTimer * 12 + coin.x * 0.2) > 0.7) {
+      // Specular sparkle glint
+      if (Math.sin(this.animTimer * 10 + coin.x * 0.25) > 0.6) {
         ctx.fillStyle = '#ffffff';
-        ctx.fillRect(-1, -4, 2, 2);
+        ctx.fillRect(-1.5, -4.5, 2.5, 2.5);
       }
 
       ctx.restore();
@@ -6626,7 +7720,13 @@ export class GameRenderer {
 
   // --- Soldiers Rendering (Mehmetçik) ---
 
-  private drawSoldiers(soldiers: Soldier[], camX: number, slots: BuildSlot[] = []) {
+  private drawSoldiers(
+    soldiers: Soldier[],
+    camX: number,
+    slots: BuildSlot[] = [],
+    commander?: PlayerCommander,
+    landingCamps: LandingCamp[] = []
+  ) {
     const ctx = this.ctx;
     const gY = this.groundY;
 
@@ -6722,75 +7822,177 @@ export class GameRenderer {
 
       // Torso & Armor
       if (soldier.isAssaultSquad) {
-        // --- ⚔️ HEAVY SHOCK TROOP / HÜCUM AKINCISI (KINGDOM KNIGHT ARCHETYPE) ---
-        // 1. Camouflage Ottoman Uniform (Haki + Zeytin Yeşili & Kestane Benekli Kamuflaj Pelerini)
-        ctx.fillStyle = '#556b2f'; // Olive Drab Base
-        ctx.fillRect(-6, -25 - bounce, 12, 16);
+        if (soldier.isAssaultHeavyArmor) {
+          // --- 🛡️ FIRST ASSAULT VANGUARD: FULL WWI HEAVY TRENCH ARMOR & STEEL SHIELD ---
+          // "sağdan ilk taaruz zırhı alan ve soldan ilk taaruz zırhı alan asker tam zırhlı (1. dünya savaşı ağır asker zırhı gibi) olsun"
+          // 1. Dark ballistic steel undercoat
+          ctx.fillStyle = '#1e293b';
+          ctx.fillRect(-6, -26 - bounce, 12, 17);
 
-        // Camouflage spots / stripes
-        ctx.fillStyle = '#2e3b12'; // Dark Forest Green
-        ctx.fillRect(-5, -23 - bounce, 4, 3);
-        ctx.fillRect(1, -17 - bounce, 4, 4);
-        ctx.fillStyle = '#4a3525'; // Earth Brown
-        ctx.fillRect(0, -21 - bounce, 4, 3);
-        ctx.fillRect(-4, -14 - bounce, 3, 3);
+          // 2. Segmented WWI Sappenpanzer Heavy Torso Armor (3 Overlapping Curved Steel Plates)
+          // Top chest breastplate
+          ctx.fillStyle = '#334155';
+          ctx.fillRect(-6.5, -25 - bounce, 13, 9);
+          ctx.fillStyle = '#64748b'; // Beveled edge highlight
+          ctx.fillRect(-5.5, -24.5 - bounce, 11, 1.5);
 
-        // 2. Heavy Ottoman Steel Cuirass (Enveriye Çelik Hücum Göğüslüğü / Zırh Plakası)
-        ctx.fillStyle = '#334155'; // Dark Steel Plate
-        ctx.fillRect(-5, -23 - bounce, 10, 11);
-        ctx.fillStyle = '#94a3b8'; // Polished Steel Bevel
-        ctx.fillRect(-4, -22 - bounce, 8, 2);
+          // Middle abdominal plate (hinged overlap)
+          ctx.fillStyle = '#1e293b';
+          ctx.fillRect(-6, -17 - bounce, 12, 5.5);
+          ctx.fillStyle = '#475569';
+          ctx.fillRect(-5, -16.5 - bounce, 10, 1.2);
 
-        // Steel Rivets
-        ctx.fillStyle = '#f59e0b'; // Brass/Steel Rivets
-        ctx.fillRect(-4, -20 - bounce, 1.5, 1.5);
-        ctx.fillRect(2.5, -20 - bounce, 1.5, 1.5);
-        ctx.fillRect(-4, -15 - bounce, 1.5, 1.5);
-        ctx.fillRect(2.5, -15 - bounce, 1.5, 1.5);
+          // Lower groin / groin apron plate
+          ctx.fillStyle = '#334155';
+          ctx.fillRect(-5.5, -12 - bounce, 11, 4.5);
 
-        // 3. Double Cross Leather Bandoliers & Stick Grenades (El Bombaları)
-        ctx.strokeStyle = '#451a03';
-        ctx.lineWidth = 1.5;
-        ctx.beginPath();
-        ctx.moveTo(-5, -23 - bounce);
-        ctx.lineTo(5, -13 - bounce);
-        ctx.moveTo(5, -23 - bounce);
-        ctx.lineTo(-5, -13 - bounce);
-        ctx.stroke();
+          // Forged steel rivets & articulation bolts
+          ctx.fillStyle = '#94a3b8';
+          ctx.fillRect(-5, -23 - bounce, 1.8, 1.8);
+          ctx.fillRect(3.2, -23 - bounce, 1.8, 1.8);
+          ctx.fillRect(-4.5, -16 - bounce, 1.5, 1.5);
+          ctx.fillRect(3, -16 - bounce, 1.5, 1.5);
+          ctx.fillStyle = '#f59e0b'; // Brass suspension chains & clasps
+          ctx.fillRect(-4.5, -19 - bounce, 1.5, 2.5);
+          ctx.fillRect(3, -19 - bounce, 1.5, 2.5);
 
-        // German/Ottoman Stielhandgranate (Ahşap Saplı Hücum Bombaları)
-        ctx.fillStyle = '#78350f'; // Wood stick
-        ctx.fillRect(-7, -19 - bounce, 2, 7);
-        ctx.fillStyle = '#1e293b'; // Steel head
-        ctx.fillRect(-8, -22 - bounce, 4, 3);
+          // Heavy steel shoulder pauldrons
+          ctx.fillStyle = '#475569';
+          ctx.fillRect(-7.5, -26 - bounce, 3.5, 5);
+          ctx.fillRect(4, -26 - bounce, 3.5, 5);
 
-        // 4. Red Ottoman Armband with White Crescent (Hücum Taburu Pazubendi)
-        ctx.fillStyle = '#dc2626';
-        ctx.fillRect(4, -23 - bounce, 3, 5);
-        ctx.fillStyle = '#fef08a';
-        ctx.fillRect(5, -22 - bounce, 1.5, 1.5);
+          // Crimson Ottoman Vanguard Armband
+          ctx.fillStyle = '#dc2626';
+          ctx.fillRect(-7, -21 - bounce, 3, 4);
+          ctx.fillStyle = '#fef08a';
+          ctx.fillRect(-6.5, -20 - bounce, 1.5, 1.5);
 
-        // 5. Head & Heavy Steel Assault Helmet (Çanakkale Hücum Miğferi)
-        ctx.fillStyle = '#fed7aa'; // Face skin tone
-        ctx.fillRect(-3, -31 - bounce, 6, 7);
+          // 3. Head & Heavy Trench Helmet with Stirnpanzer Forehead Armor
+          ctx.fillStyle = '#fed7aa'; // Face skin tone
+          ctx.fillRect(-3, -31 - bounce, 6, 7);
+          ctx.fillStyle = '#0f172a'; // Eyes & thick mustache
+          ctx.fillRect(1, -29 - bounce, 2, 1.5);
+          ctx.fillRect(0, -26 - bounce, 3, 1.5);
 
-        // Mustache & Intense Eyes
-        ctx.fillStyle = '#0f172a';
-        ctx.fillRect(1, -29 - bounce, 2, 1.5);
-        ctx.fillRect(0, -26 - bounce, 3, 1.5);
+          // Steel helmet dome
+          ctx.fillStyle = '#1e293b';
+          ctx.beginPath();
+          ctx.ellipse(0, -33 - bounce, 8, 5, 0, 0, Math.PI * 2);
+          ctx.fill();
 
-        // Steel Assault Helmet with Imperial Brass Crescent Badge
-        ctx.fillStyle = '#475569'; // Steel Helmet
-        ctx.beginPath();
-        ctx.ellipse(0, -33 - bounce, 7.5, 4.5, 0, 0, Math.PI * 2);
-        ctx.fill();
-        ctx.fillRect(-6, -34 - bounce, 12, 4);
+          // Stirnpanzer heavy curved brow armor plate clamped to helmet
+          ctx.fillStyle = '#475569';
+          ctx.fillRect(-1, -36 - bounce, 8.5, 4.5);
+          ctx.fillStyle = '#94a3b8'; // Steel rim
+          ctx.fillRect(-1, -34 - bounce, 9, 1.5);
+          ctx.fillStyle = '#f59e0b'; // Imperial Ottoman brass crescent badge
+          ctx.beginPath();
+          ctx.arc(3, -34 - bounce, 2, 0, Math.PI * 2);
+          ctx.fill();
 
-        // Brass Crescent Emblem on Front
-        ctx.fillStyle = '#f59e0b';
-        ctx.beginPath();
-        ctx.arc(2, -33 - bounce, 2, 0, Math.PI * 2);
-        ctx.fill();
+          // 4. --- 🛡️ AUTHENTIC WWI GERMAN/OTTOMAN SAPPENPANZER LAMELLAR PLATES ---
+          // Three articulated curved overlapping ballistic plates protecting abdomen & groin
+          // (User: "kalkanı olmasın dediğin Sappenpanzer zırhı olmamış o zırh olsun" - both hands free for Mauser rifle!)
+          // 1st Upper Abdominal Laminar Plate
+          ctx.fillStyle = '#334155';
+          ctx.fillRect(-6, -17 - bounce, 12, 5.5);
+          ctx.fillStyle = '#64748b'; // Rolled edge
+          ctx.fillRect(-5.5, -16.5 - bounce, 11, 1.2);
+
+          // 2nd Lower Abdominal Laminar Plate (nested underneath)
+          ctx.fillStyle = '#1e293b';
+          ctx.fillRect(-5.5, -12 - bounce, 11, 5);
+          ctx.fillStyle = '#475569';
+          ctx.fillRect(-5, -11.5 - bounce, 10, 1.2);
+
+          // 3rd Groin Apron Tasset Plate (hanging protector)
+          ctx.fillStyle = '#334155';
+          ctx.fillRect(-4.5, -7 - bounce, 9, 4.5);
+          ctx.fillStyle = '#64748b';
+          ctx.fillRect(-4, -6.5 - bounce, 8, 1);
+
+          // Heavy Canvas/Leather Suspension Straps down flanks with brass rivets
+          ctx.fillStyle = '#78350f'; // Tough leather webbing
+          ctx.fillRect(-5.5, -23 - bounce, 1.8, 18);
+          ctx.fillRect(3.7, -23 - bounce, 1.8, 18);
+          ctx.fillStyle = '#f59e0b'; // Brass rivets connecting articulated lamellae
+          ctx.fillRect(-5.2, -21 - bounce, 1.2, 1.2);
+          ctx.fillRect(4.0, -21 - bounce, 1.2, 1.2);
+          ctx.fillRect(-5.2, -15 - bounce, 1.2, 1.2);
+          ctx.fillRect(4.0, -15 - bounce, 1.2, 1.2);
+          ctx.fillRect(-5.2, -10 - bounce, 1.2, 1.2);
+          ctx.fillRect(4.0, -10 - bounce, 1.2, 1.2);
+        } else {
+          // --- ⚔️ NORMAL ASSAULT TROOP (2. ve Sonrakiler: Mevcut Taarruz Askeri Görünümü) ---
+          // 1. Camouflage Ottoman Uniform (Haki + Zeytin Yeşili & Kestane Benekli Kamuflaj Pelerini)
+          ctx.fillStyle = '#556b2f'; // Olive Drab Base
+          ctx.fillRect(-6, -25 - bounce, 12, 16);
+
+          // Camouflage spots / stripes
+          ctx.fillStyle = '#2e3b12'; // Dark Forest Green
+          ctx.fillRect(-5, -23 - bounce, 4, 3);
+          ctx.fillRect(1, -17 - bounce, 4, 4);
+          ctx.fillStyle = '#4a3525'; // Earth Brown
+          ctx.fillRect(0, -21 - bounce, 4, 3);
+          ctx.fillRect(-4, -14 - bounce, 3, 3);
+
+          // 2. Heavy Ottoman Steel Cuirass (Enveriye Çelik Hücum Göğüslüğü / Zırh Plakası)
+          ctx.fillStyle = '#334155'; // Dark Steel Plate
+          ctx.fillRect(-5, -23 - bounce, 10, 11);
+          ctx.fillStyle = '#94a3b8'; // Polished Steel Bevel
+          ctx.fillRect(-4, -22 - bounce, 8, 2);
+
+          // Steel Rivets
+          ctx.fillStyle = '#f59e0b'; // Brass/Steel Rivets
+          ctx.fillRect(-4, -20 - bounce, 1.5, 1.5);
+          ctx.fillRect(2.5, -20 - bounce, 1.5, 1.5);
+          ctx.fillRect(-4, -15 - bounce, 1.5, 1.5);
+          ctx.fillRect(2.5, -15 - bounce, 1.5, 1.5);
+
+          // 3. Double Cross Leather Bandoliers & Stick Grenades (El Bombaları)
+          ctx.strokeStyle = '#451a03';
+          ctx.lineWidth = 1.5;
+          ctx.beginPath();
+          ctx.moveTo(-5, -23 - bounce);
+          ctx.lineTo(5, -13 - bounce);
+          ctx.moveTo(5, -23 - bounce);
+          ctx.lineTo(-5, -13 - bounce);
+          ctx.stroke();
+
+          // German/Ottoman Stielhandgranate (Ahşap Saplı Hücum Bombaları)
+          ctx.fillStyle = '#78350f'; // Wood stick
+          ctx.fillRect(-7, -19 - bounce, 2, 7);
+          ctx.fillStyle = '#1e293b'; // Steel head
+          ctx.fillRect(-8, -22 - bounce, 4, 3);
+
+          // 4. Red Ottoman Armband with White Crescent (Hücum Taburu Pazubendi)
+          ctx.fillStyle = '#dc2626';
+          ctx.fillRect(4, -23 - bounce, 3, 5);
+          ctx.fillStyle = '#fef08a';
+          ctx.fillRect(5, -22 - bounce, 1.5, 1.5);
+
+          // 5. Head & Heavy Steel Assault Helmet (Çanakkale Hücum Miğferi)
+          ctx.fillStyle = '#fed7aa'; // Face skin tone
+          ctx.fillRect(-3, -31 - bounce, 6, 7);
+
+          // Mustache & Intense Eyes
+          ctx.fillStyle = '#0f172a';
+          ctx.fillRect(1, -29 - bounce, 2, 1.5);
+          ctx.fillRect(0, -26 - bounce, 3, 1.5);
+
+          // Steel Assault Helmet with Imperial Brass Crescent Badge
+          ctx.fillStyle = '#475569'; // Steel Helmet
+          ctx.beginPath();
+          ctx.ellipse(0, -33 - bounce, 7.5, 4.5, 0, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.fillRect(-6, -34 - bounce, 12, 4);
+
+          // Brass Crescent Emblem on Front
+          ctx.fillStyle = '#f59e0b';
+          ctx.beginPath();
+          ctx.arc(2, -33 - bounce, 2, 0, Math.PI * 2);
+          ctx.fill();
+        }
       } else {
         // Standard Khaki Ottoman Uniform
         ctx.fillStyle = '#716b4e';
@@ -7149,6 +8351,31 @@ export class GameRenderer {
         ctx.textBaseline = 'middle';
         ctx.fillText(`${soldier.coinsHeld}`, sx, coinBadgeY + 0.5);
       }
+
+      // Charge / Counter-Attack Coin Socket for Heavy Vanguard Soldier:
+      // User: "taaruzun başındaki zırhlı askere 1 sikke verirsem taaruza gitsin gemiye saldırmaya"
+      if (soldier.isAssaultHeavyArmor && soldier.health > 0) {
+        const otherCampAlive = landingCamps && landingCamps.find((c) => !c.isDestroyed);
+        const isNearCmd = commander && Math.abs(commander.x - soldier.x) < 55;
+
+        if (soldier.assaultState === 'defending') {
+          this.drawCoinSocketsOverhead(sx, sy - 52, 1, 0);
+          if (isNearCmd) {
+            ctx.fillStyle = '#fde047';
+            ctx.font = 'bold 8.5px sans-serif';
+            ctx.textAlign = 'center';
+            ctx.fillText('[E] Taarruz Emri (1🪙)', sx, sy - 60);
+          }
+        } else if (otherCampAlive && !soldier.targetCampId) {
+          this.drawCoinSocketsOverhead(sx, sy - 52, 1, 0);
+          if (isNearCmd) {
+            ctx.fillStyle = '#fde047';
+            ctx.font = 'bold 8.5px sans-serif';
+            ctx.textAlign = 'center';
+            ctx.fillText('[E] Karşı Gemiye Hücum (1🪙)', sx, sy - 60);
+          }
+        }
+      }
     }
   }
 
@@ -7225,8 +8452,44 @@ export class GameRenderer {
         ctx.restore();
 
         // Torso
-        ctx.fillStyle = '#854d0e';
-        ctx.fillRect(-5, -24 - bounce, 10, 15);
+        if (enemy.type === 'officer') {
+          // --- 🎖️ BRITISH/ANZAC INFANTRY OFFICER (ELİT SUBAY ZIRHI VE ÜNİFORMASI) ---
+          // Deep dark officer tunic
+          ctx.fillStyle = '#451a03';
+          ctx.fillRect(-5, -24 - bounce, 10, 15);
+
+          // Hardened Officer Steel Breastplate / Heavy Cuirass (Zırh Plakası)
+          ctx.fillStyle = '#334155';
+          ctx.fillRect(-5, -23 - bounce, 10, 11);
+          ctx.fillStyle = '#94a3b8';
+          ctx.fillRect(-4, -22 - bounce, 8, 2);
+
+          // Golden Officer Gorget (Boğaz Zırhı / Subay Hilal Plaketi)
+          ctx.fillStyle = '#eab308';
+          ctx.beginPath();
+          ctx.arc(0, -23 - bounce, 2.5, 0, Math.PI);
+          ctx.fill();
+
+          // Sam Browne Leather Cross-Belt with Brass Buckle & Crimson Officer Sash
+          ctx.strokeStyle = '#292524';
+          ctx.lineWidth = 1.5;
+          ctx.beginPath();
+          ctx.moveTo(-4, -24 - bounce);
+          ctx.lineTo(4, -13 - bounce);
+          ctx.stroke();
+
+          // Crimson officer sash
+          ctx.fillStyle = '#991b1b';
+          ctx.fillRect(-5, -13 - bounce, 10, 3);
+
+          // Gold Bullion Epaulets on shoulders
+          ctx.fillStyle = '#eab308';
+          ctx.fillRect(-6, -24 - bounce, 3, 2);
+          ctx.fillRect(3, -24 - bounce, 3, 2);
+        } else {
+          ctx.fillStyle = '#854d0e';
+          ctx.fillRect(-5, -24 - bounce, 10, 15);
+        }
 
         // Head & Hat
         ctx.fillStyle = '#fbcfe8';
@@ -8056,8 +9319,8 @@ export class GameRenderer {
     ctx.scale(commander.facing, 1);
 
     const isMoving = commander.state === 'walking' || commander.state === 'galloping';
-    const gallopTimer = this.animTimer * (commander.isSprinting ? 9.2 : 5.8);
-    const gallopBob = isMoving ? Math.sin(gallopTimer) * (commander.isSprinting ? 1.2 : 0.5) : 0;
+    const gallopTimer = this.animTimer * (commander.isSprinting ? 6.2 : 4.4);
+    const gallopBob = isMoving ? Math.sin(gallopTimer) * (commander.isSprinting ? 0.75 : 0.35) : 0;
 
     if (commander.isMounted) {
       const mType = commander.mountType || 'white';
@@ -8066,7 +9329,7 @@ export class GameRenderer {
       });
 
       // Classic Leather Reins connecting bit to Commander's hand
-      const headNod = isMoving ? (commander.isSprinting ? -Math.sin(gallopTimer % (Math.PI * 2)) * 0.7 : Math.sin(gallopTimer * 2 + 0.6) * 0.35) : 0;
+      const headNod = isMoving ? (commander.isSprinting ? -Math.sin(gallopTimer % (Math.PI * 2)) * 0.45 : Math.sin(gallopTimer * 2 + 0.6) * 0.25) : 0;
       const bitX = 27;
       const bitY = -29 + gallopBob + headNod;
       const handX = 4;
@@ -8255,6 +9518,250 @@ export class GameRenderer {
     }
 
     ctx.restore();
+
+    // 3. In-Game Interactive Key Tutorial above Commander (Kingdom Two Crowns style)
+    if (state.inGameTutorial?.enabled) {
+      this.drawCommanderInGameTutorial(commander, camX, state);
+    }
+  }
+
+  private drawCommanderInGameTutorial(commander: PlayerCommander, camX: number, state: GameState) {
+    const tut = state.inGameTutorial;
+    if (!tut || !tut.enabled) return;
+
+    const ctx = this.ctx;
+    const sx = commander.x - camX;
+    const sy = this.groundY; // 440
+
+    if (sx < -140 || sx > this.width + 140) return;
+
+    ctx.save();
+    ctx.globalAlpha = Math.max(0, Math.min(1, tut.fadeAlpha));
+
+    const bob = Math.sin(this.animTimer * 4.5) * 3;
+    const isHorse = commander.isMounted;
+    const targetY = sy - (isHorse ? 104 : 88) + bob;
+
+    const drawRRect = (x: number, y: number, w: number, h: number, r: number) => {
+      ctx.beginPath();
+      if (typeof ctx.roundRect === 'function') {
+        ctx.roundRect(x, y, w, h, r);
+      } else {
+        ctx.rect(x, y, w, h);
+      }
+    };
+
+    let boxW = 210;
+    let boxH = 46;
+
+    if (tut.step === 'goto_hq') {
+      boxW = 224;
+    } else if (tut.step === 'collect_coins') {
+      boxW = 214;
+    } else if (tut.step === 'buy_rifle') {
+      boxW = 236;
+    } else if (tut.step === 'recruit_soldier') {
+      boxW = 228;
+    } else if (tut.step === 'chop_tree') {
+      boxW = 224;
+    } else if (tut.step === 'build_trench') {
+      boxW = 226;
+    } else if (tut.step === 'build_wire') {
+      boxW = 236;
+    } else if (tut.step === 'use_whistle') {
+      boxW = 224;
+    } else if (tut.step === 'done') {
+      boxW = 224;
+      boxH = 46;
+    }
+
+    const boxX = sx - boxW / 2;
+    const boxY = targetY - boxH;
+
+    // Speech bubble triangle pointing down to commander
+    ctx.fillStyle = 'rgba(28, 25, 23, 0.95)';
+    ctx.beginPath();
+    ctx.moveTo(sx - 7, targetY);
+    ctx.lineTo(sx + 7, targetY);
+    ctx.lineTo(sx, targetY + 7);
+    ctx.closePath();
+    ctx.fill();
+
+    // Box Background with subtle shadow
+    ctx.shadowColor = tut.isStepCompleted ? 'rgba(34, 197, 94, 0.45)' : 'rgba(245, 158, 11, 0.35)';
+    ctx.shadowBlur = 10;
+    ctx.shadowOffsetY = 2;
+
+    drawRRect(boxX, boxY, boxW, boxH, 10);
+    ctx.fillStyle = 'rgba(24, 21, 18, 0.94)';
+    ctx.fill();
+
+    // Border
+    ctx.shadowBlur = 0;
+    ctx.lineWidth = 1.8;
+    ctx.strokeStyle = tut.isStepCompleted ? '#22c55e' : '#f59e0b';
+    ctx.stroke();
+
+    // Subtle inner highlight
+    ctx.lineWidth = 1;
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.12)';
+    drawRRect(boxX + 1.5, boxY + 1.5, boxW - 3, boxH - 3, 8.5);
+    ctx.stroke();
+
+    const drawKeycap = (kx: number, ky: number, kw: number, kh: number, text: string, isDone: boolean = false) => {
+      drawRRect(kx, ky, kw, kh, 5);
+      ctx.fillStyle = isDone ? '#14532d' : '#292524';
+      ctx.fill();
+      ctx.strokeStyle = isDone ? '#22c55e' : '#78716c';
+      ctx.lineWidth = 1.2;
+      ctx.stroke();
+
+      ctx.fillStyle = isDone ? '#166534' : '#44403c';
+      drawRRect(kx + 1, ky + 1, kw - 2, kh - 3, 4);
+      ctx.fill();
+
+      ctx.fillStyle = isDone ? '#86efac' : '#fef08a';
+      ctx.font = 'bold 11px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(text, kx + kw / 2, ky + kh / 2 - 0.5);
+    };
+
+    if (tut.isStepCompleted && tut.step !== 'done') {
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.font = 'bold 12px sans-serif';
+      ctx.fillStyle = '#4ade80';
+
+      let doneTitle = '✓ Tamamlandı';
+      if (tut.step === 'goto_hq') doneTitle = '✓ Karargaha Ulaşıldı';
+      else if (tut.step === 'collect_coins') doneTitle = '✓ Sikkeler Toplandı';
+      else if (tut.step === 'buy_rifle') doneTitle = '✓ Tüfek Tezgaha Bırakıldı';
+      else if (tut.step === 'recruit_soldier') doneTitle = '✓ Gönüllü Nefer Alındı';
+      else if (tut.step === 'chop_tree') doneTitle = '✓ Ağaç Kesimi Başlatıldı';
+      else if (tut.step === 'build_trench') doneTitle = '✓ Siper Tahkim Edildi';
+      else if (tut.step === 'build_wire') doneTitle = '✓ Dikenli Tel Kuruldu';
+      else if (tut.step === 'use_whistle') doneTitle = '✓ Taarruz Düdüğü Çalındı';
+
+      ctx.fillText(doneTitle, sx, boxY + 16);
+
+      ctx.font = '10px sans-serif';
+      ctx.fillStyle = '#cbd5e1';
+      ctx.fillText('Sıradaki adıma geçiliyor...', sx, boxY + 32);
+    } else if (tut.step === 'goto_hq') {
+      const hqX = state.level.worldWidth / 2;
+      const distM = Math.max(1, Math.round(Math.abs(commander.x - hqX) / 10));
+      const isRight = hqX > commander.x;
+
+      drawKeycap(boxX + 12, boxY + 8, 28, 20, isRight ? 'D' : 'A');
+
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'middle';
+      ctx.font = 'bold 11px sans-serif';
+      ctx.fillStyle = '#fef08a';
+      ctx.fillText(isRight ? 'Karargaha İlerle ▶' : '◀ Karargaha İlerle', boxX + 46, boxY + 18);
+
+      ctx.font = '9.5px sans-serif';
+      ctx.fillStyle = '#d6d3d1';
+      ctx.fillText(`[Shift] Dörtnala Koş  •  ${distM}m`, boxX + 46, boxY + 32);
+    } else if (tut.step === 'collect_coins') {
+      drawKeycap(boxX + 12, boxY + 8, 30, 20, '💰');
+
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'middle';
+      ctx.font = 'bold 11px sans-serif';
+      ctx.fillStyle = '#fef08a';
+      ctx.fillText('Yerdeki Sikkeleri Topla', boxX + 48, boxY + 18);
+
+      ctx.font = '9.5px sans-serif';
+      ctx.fillStyle = '#d6d3d1';
+      ctx.fillText(`Atla üzerinden geç (${commander.mecidiye} / 3 Sikke)`, boxX + 48, boxY + 32);
+    } else if (tut.step === 'buy_rifle') {
+      drawKeycap(boxX + 12, boxY + 8, 26, 20, 'E');
+
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'middle';
+      ctx.font = 'bold 11px sans-serif';
+      ctx.fillStyle = '#fef08a';
+      ctx.fillText('Askerlere Silah Bırak (2🪙)', boxX + 44, boxY + 18);
+
+      ctx.font = '9.5px sans-serif';
+      ctx.fillStyle = '#d6d3d1';
+      ctx.fillText('Tezgaha git ve [E] ile tüfek bırak', boxX + 44, boxY + 32);
+    } else if (tut.step === 'recruit_soldier') {
+      drawKeycap(boxX + 12, boxY + 8, 26, 20, 'E');
+
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'middle';
+      ctx.font = 'bold 11px sans-serif';
+      ctx.fillStyle = '#fef08a';
+      ctx.fillText('Köyden Asker Al (1🪙)', boxX + 44, boxY + 18);
+
+      ctx.font = '9.5px sans-serif';
+      ctx.fillStyle = '#d6d3d1';
+      ctx.fillText('Çadıra git ve [E] ile nefer topla', boxX + 44, boxY + 32);
+    } else if (tut.step === 'chop_tree') {
+      drawKeycap(boxX + 12, boxY + 8, 26, 20, 'E');
+
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'middle';
+      ctx.font = 'bold 11px sans-serif';
+      ctx.fillStyle = '#fef08a';
+      ctx.fillText('Çam Ağacını Kes (1🪙)', boxX + 44, boxY + 18);
+
+      ctx.font = '9.5px sans-serif';
+      ctx.fillStyle = '#d6d3d1';
+      ctx.fillText('Ağacın yanına git ve [E] ile odun topla', boxX + 44, boxY + 32);
+    } else if (tut.step === 'build_trench') {
+      drawKeycap(boxX + 12, boxY + 8, 26, 20, 'E');
+
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'middle';
+      ctx.font = 'bold 11px sans-serif';
+      ctx.fillStyle = '#fef08a';
+      ctx.fillText('Siper Kaz ve Kur (2🪙)', boxX + 44, boxY + 18);
+
+      ctx.font = '9.5px sans-serif';
+      ctx.fillStyle = '#d6d3d1';
+      ctx.fillText('Siper mevzisine git ve [E] bas', boxX + 44, boxY + 32);
+    } else if (tut.step === 'build_wire') {
+      drawKeycap(boxX + 12, boxY + 8, 26, 20, 'E');
+
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'middle';
+      ctx.font = 'bold 11px sans-serif';
+      ctx.fillStyle = '#fef08a';
+      ctx.fillText('Dikenli Tel Engeli Kur (2🪙)', boxX + 44, boxY + 18);
+
+      ctx.font = '9.5px sans-serif';
+      ctx.fillStyle = '#d6d3d1';
+      ctx.fillText('Tel mevzisine git ve [E] bas (Yavaşlatır)', boxX + 44, boxY + 32);
+    } else if (tut.step === 'use_whistle') {
+      drawKeycap(boxX + 12, boxY + 8, 28, 20, 'Q');
+
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'middle';
+      ctx.font = 'bold 11px sans-serif';
+      ctx.fillStyle = '#fef08a';
+      ctx.fillText('Taarruz Düdüğü [Q]', boxX + 46, boxY + 18);
+
+      ctx.font = '9.5px sans-serif';
+      ctx.fillStyle = '#d6d3d1';
+      ctx.fillText('Mehmetçiğe hücum emri & moral ver', boxX + 46, boxY + 32);
+    } else if (tut.step === 'done') {
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+
+      ctx.font = 'bold 12px sans-serif';
+      ctx.fillStyle = '#fbbf24';
+      ctx.fillText('🎖️ Talim Tamamlandı', sx, boxY + 16);
+
+      ctx.font = '10px sans-serif';
+      ctx.fillStyle = '#fef08a';
+      ctx.fillText('Gece düşman baskınına hazırlan!', sx, boxY + 32);
+    }
+
+    ctx.restore();
   }
 
   // --- Projectiles & Particles ---
@@ -8387,8 +9894,15 @@ export class GameRenderer {
 
   private drawParticles(particles: Particle[], camX: number) {
     const ctx = this.ctx;
+    const overBudget = this.isOverBudget();
 
-    for (const pt of particles) {
+    for (let i = 0; i < particles.length; i++) {
+      const pt = particles[i];
+      // Frame Budget Protection: Under heavy combat / CPU load, skip low-priority decorative ambient snow/rain particles
+      if (overBudget && (pt.type === 'snow' || (pt.type === 'rain' && (i % 2 === 1)))) {
+        continue;
+      }
+
       const sx = pt.x - camX;
       if (sx < -20 || sx > this.width + 20) continue;
 
@@ -8425,18 +9939,325 @@ export class GameRenderer {
     }
   }
 
+  // --- Dynamic Atmospheric Depth: Rolling Fog & Gentle Rain (Zero GC Allocations) ---
+
+  private drawAtmosphericFog(camX: number, state: GameState) {
+    const isFog = state.weather === 'fog';
+    const isDawnOrDusk = state.timePhase === 'dawn' || state.timePhase === 'dusk';
+    const baseFogAlpha = isFog
+      ? Math.max(0.22, state.weatherIntensity * 0.52)
+      : (isDawnOrDusk ? 0.12 : 0);
+    if (baseFogAlpha <= 0.01) return;
+
+    const ctx = this.ctx;
+    const gY = this.groundY;
+    const isNight = state.dayProgress > 0.70;
+
+    ctx.save();
+
+    // 1. Ground Rolling Mist Banks (Siper ve Kıyı Sisi)
+    const mistColor = isNight
+      ? '30, 41, 59' // deep slate-blue night mist
+      : (state.timePhase === 'dawn' ? '254, 240, 138' : '241, 245, 249'); // golden dawn mist or silver daytime fog
+
+    const gradA = ctx.createLinearGradient(0, gY - 45, 0, gY + 12);
+    gradA.addColorStop(0, `rgba(${mistColor}, 0)`);
+    gradA.addColorStop(0.5, `rgba(${mistColor}, ${(baseFogAlpha * 0.42).toFixed(3)})`);
+    gradA.addColorStop(1, `rgba(${mistColor}, 0)`);
+    ctx.fillStyle = gradA;
+    ctx.fillRect(0, gY - 45, this.width, 57);
+
+    // 2. Organic undulating fog billows (Skip if frame budget exceeded)
+    if (!this.isOverBudget()) {
+      const billowCount = 7;
+      for (let i = 0; i < billowCount; i++) {
+        const billowX = (((i * 240 + this.animTimer * 18 - camX * 0.35) % (this.width + 360) + this.width + 360) % (this.width + 360)) - 180;
+        const billowY = gY - 24 + Math.sin(this.animTimer * 0.9 + i * 1.4) * 7;
+        const billowW = 190 + (i % 3) * 45;
+        const billowH = 26 + (i % 2) * 10;
+
+        const billowGrad = ctx.createRadialGradient(billowX, billowY, 4, billowX, billowY, billowW * 0.5);
+        billowGrad.addColorStop(0, `rgba(${mistColor}, ${(baseFogAlpha * 0.32).toFixed(3)})`);
+        billowGrad.addColorStop(0.6, `rgba(${mistColor}, ${(baseFogAlpha * 0.16).toFixed(3)})`);
+        billowGrad.addColorStop(1, `rgba(${mistColor}, 0)`);
+
+        ctx.fillStyle = billowGrad;
+        ctx.beginPath();
+        ctx.ellipse(billowX, billowY, billowW * 0.5, billowH * 0.5, 0, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+
+    // 3. Distant ridge & strait mist during thick fog
+    if (isFog && state.weatherIntensity > 0.3) {
+      const ridgeGrad = ctx.createLinearGradient(0, gY - 150, 0, gY - 60);
+      ridgeGrad.addColorStop(0, `rgba(${mistColor}, 0)`);
+      ridgeGrad.addColorStop(0.5, `rgba(${mistColor}, ${(baseFogAlpha * 0.20).toFixed(3)})`);
+      ridgeGrad.addColorStop(1, `rgba(${mistColor}, 0)`);
+      ctx.fillStyle = ridgeGrad;
+      ctx.fillRect(0, gY - 150, this.width, 90);
+    }
+
+    ctx.restore();
+  }
+
+  private drawAtmosphericRain(camX: number, state: GameState) {
+    if (state.weather !== 'rain' && state.weather !== 'storm') return;
+    const intensity = Math.max(0.2, state.weatherIntensity || 0.6);
+    const ctx = this.ctx;
+    const gY = this.groundY;
+    const isStorm = state.weather === 'storm';
+
+    ctx.save();
+
+    // 1. Dynamic Thunderstorm Lightning Flash
+    if (isStorm) {
+      const lightningCycle = (this.animTimer * 0.12) % 1.0;
+      // Triggers for ~0.08s every ~8.3 seconds
+      if (lightningCycle < 0.015) {
+        ctx.fillStyle = 'rgba(224, 242, 254, 0.30)';
+        ctx.fillRect(0, 0, this.width, this.height);
+      } else if (lightningCycle > 0.022 && lightningCycle < 0.030) {
+        // Double-flash aftershock
+        ctx.fillStyle = 'rgba(224, 242, 254, 0.18)';
+        ctx.fillRect(0, 0, this.width, this.height);
+      }
+    }
+
+    // 2. Wet Soil Glaze & Mud Sheen on Ground Line (Islak Zemin Parlaması)
+    const wetGleamGrad = ctx.createLinearGradient(0, gY - 2, 0, gY + 8);
+    wetGleamGrad.addColorStop(0, 'rgba(15, 23, 42, 0.40)');
+    wetGleamGrad.addColorStop(0.3, isStorm ? 'rgba(186, 230, 253, 0.18)' : 'rgba(224, 242, 254, 0.14)');
+    wetGleamGrad.addColorStop(1, 'rgba(15, 23, 42, 0)');
+    ctx.fillStyle = wetGleamGrad;
+    ctx.fillRect(0, gY - 2, this.width, 10);
+
+    // 3. Ground Raindrop Impacts & Rapid Splashes Across Battlefield (Yağan Yağmurla Tam Senkronize Hızlı Çarpmalar)
+    // Synchronized at high frequency (8.5 - 15 Hz) to match rain velocity (~750 px/s)
+    const splashCount = Math.floor(42 + intensity * 45);
+    for (let s = 0; s < splashCount; s++) {
+      // Deterministic world coordinates anchored to world ground
+      const worldDropX = ((s * 137.3 + Math.sin(s * 19) * 55));
+      const dropCycleSpeed = 8.5 + (s % 7) * 1.8;
+      const dropProgress = (this.animTimer * dropCycleSpeed + s * 0.17) % 1.0;
+      const sx = ((worldDropX - camX) % (this.width + 120) + this.width + 120) % (this.width + 120) - 60;
+
+      // Fast expanding circular ripple on the ground
+      const rR = 1.0 + dropProgress * 8.5;
+      const rAlpha = Math.max(0, Math.pow(1 - dropProgress, 1.6) * (isStorm ? 0.70 : 0.48));
+      ctx.strokeStyle = `rgba(224, 242, 254, ${rAlpha.toFixed(3)})`;
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.ellipse(sx, gY, rR, rR * 0.30, 0, 0, Math.PI * 2);
+      ctx.stroke();
+
+      // Micro-droplet upward splashes popping rapidly with gravity arc (Hızlı Su Sıçramaları)
+      if (dropProgress < 0.55) {
+        const splashHeight = Math.sin((dropProgress / 0.55) * Math.PI) * (4.2 + (s % 4) * 2.8);
+        const dropAlpha = (1 - dropProgress / 0.55) * (isStorm ? 0.95 : 0.80);
+        ctx.fillStyle = `rgba(240, 249, 255, ${dropAlpha.toFixed(3)})`;
+        ctx.fillRect(sx - 1.2, gY - splashHeight, 1.5, 1.5);
+        ctx.fillRect(sx + 1.4, gY - splashHeight * 0.72, 1.2, 1.2);
+      }
+    }
+
+    // 4. Water Surface Impacts, Expanding Ripples & Splashes on Bottom River / Sea Water (Toprağın Alt Tarafındaki Su)
+    const waterBaseY = this.height - 68;
+    const waterSplashCount = Math.floor(48 + intensity * 48);
+
+    for (let w = 0; w < waterSplashCount; w++) {
+      const dropCycleSpeed = 8.2 + (w % 7) * 1.8;
+      const wProgress = (this.animTimer * dropCycleSpeed + w * 0.21) % 1.0;
+      const wx = ((w * 97.3 + Math.sin(w * 13) * 60 - camX * 0.35) % (this.width + 80) + (this.width + 80)) % (this.width + 80) - 40;
+      const depthOffset = ((w * 23) % 58);
+      const targetWaterY = waterBaseY + depthOffset;
+
+      // Concentric elliptical water ripple expanding on water surface
+      const ripRadiusX = 2.5 + wProgress * (16.0 + (w % 4) * 5.0);
+      const ripRadiusY = ripRadiusX * 0.30;
+      const ripAlpha = Math.max(0, Math.pow(1 - wProgress, 1.4) * (isStorm ? 0.85 : 0.65));
+
+      ctx.strokeStyle = `rgba(240, 249, 255, ${ripAlpha.toFixed(3)})`;
+      ctx.lineWidth = 1.2;
+      ctx.beginPath();
+      ctx.ellipse(wx, targetWaterY, ripRadiusX, ripRadiusY, 0, 0, Math.PI * 2);
+      ctx.stroke();
+
+      // Second inner ring for realistic liquid shockwave
+      if (wProgress > 0.20) {
+        const innerRadiusX = ripRadiusX * 0.52;
+        ctx.strokeStyle = `rgba(186, 230, 253, ${(ripAlpha * 0.75).toFixed(3)})`;
+        ctx.lineWidth = 1.0;
+        ctx.beginPath();
+        ctx.ellipse(wx, targetWaterY, innerRadiusX, innerRadiusX * 0.30, 0, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+
+      // Vertical Water Droplet Bounce / Worthington Jet (Su yüzeyinden sıçrayan su damlacıkları)
+      if (wProgress < 0.52) {
+        const bounceHeight = Math.sin((wProgress / 0.52) * Math.PI) * (4.5 + (w % 4) * 3.0);
+        const bounceAlpha = (1 - wProgress / 0.52) * (isStorm ? 0.95 : 0.85);
+        ctx.fillStyle = `rgba(255, 255, 255, ${bounceAlpha.toFixed(3)})`;
+        ctx.fillRect(wx - 1.0, targetWaterY - bounceHeight, 2.0, 2.0);
+        ctx.fillStyle = `rgba(186, 230, 253, ${(bounceAlpha * 0.85).toFixed(3)})`;
+        ctx.fillRect(wx + 1.2, targetWaterY - bounceHeight * 0.65, 1.5, 1.5);
+      }
+    }
+
+    // Additional Coastal Sea Water Droplet Ripples at Map Beach Edges (if visible)
+    const leftBeachX = 260 - camX;
+    const rightBeachX = state.level.worldWidth - 260 - camX;
+
+    if (leftBeachX > 0 || rightBeachX < this.width) {
+      for (let b = 0; b < 16; b++) {
+        const bSpeed = 8.5 + (b % 5) * 2.0;
+        const bProgress = (this.animTimer * bSpeed + b * 0.27) % 1.0;
+        const inLeft = (b % 2 === 0 && leftBeachX > 0);
+        const bx = inLeft 
+          ? ((b * 47) % Math.min(leftBeachX, this.width))
+          : (rightBeachX < this.width ? rightBeachX + ((b * 53) % (this.width - rightBeachX)) : -999);
+
+        if (bx > 0 && bx < this.width) {
+          const by = gY + 12 + ((b * 19) % (this.height - gY - 18));
+          const bR = 2.0 + bProgress * 11.0;
+          const bAlpha = Math.max(0, (1 - bProgress) * 0.5);
+          ctx.strokeStyle = `rgba(224, 242, 254, ${bAlpha.toFixed(3)})`;
+          ctx.lineWidth = 1;
+          ctx.beginPath();
+          ctx.ellipse(bx, by, bR, bR * 0.32, 0, 0, Math.PI * 2);
+          ctx.stroke();
+
+          if (bProgress < 0.45) {
+            const bSplash = Math.sin((bProgress / 0.45) * Math.PI) * 4.0;
+            ctx.fillStyle = 'rgba(240, 249, 255, 0.85)';
+            ctx.fillRect(bx - 0.75, by - bSplash, 1.5, 1.5);
+          }
+        }
+      }
+    }
+
+    // 6. Batched Diagonal Rain Streaks Across Entire Screen (Toprağın Altındaki Suya Kadar İner)
+    ctx.strokeStyle = isStorm ? 'rgba(147, 197, 253, 0.55)' : 'rgba(191, 219, 254, 0.42)';
+    ctx.lineWidth = isStorm ? 1.4 : 1.1;
+
+    const streakCount = Math.floor(60 + intensity * 50);
+    const windTilt = isStorm ? -7 : -4;
+    ctx.beginPath();
+    for (let i = 0; i < streakCount; i++) {
+      const speed = 750 + (i % 6) * 60;
+      const rx = (((i * 41.7 - this.animTimer * 190 - camX * 0.25) % this.width + this.width) % this.width);
+      // Streak falls through the entire canvas height down to the bottom water!
+      const ry = ((i * 15.3 + this.animTimer * speed) % (this.height + 25));
+      const streakLen = 16 + (i % 4) * 6;
+      ctx.moveTo(rx, ry);
+      ctx.lineTo(rx + windTilt, ry + streakLen);
+    }
+    ctx.stroke();
+
+    ctx.restore();
+  }
+
+  // --- Atmospheric Winter Snowfall & Drifting Flurries (Kış Mevsimi Kar Yağışı) ---
+
+  private drawAtmosphericSnow(camX: number, state: GameState) {
+    if (state.season !== 'winter') return;
+    if (state.weather !== 'snow' && state.weather !== 'storm') return;
+
+    const ctx = this.ctx;
+    const gY = this.groundY;
+    const isStorm = state.weather === 'storm';
+    const intensity = state.weather === 'snow'
+      ? Math.max(0.4, state.weatherIntensity || 0.8)
+      : (isStorm ? 1.0 : this.winterProgress * 0.7);
+
+    ctx.save();
+
+    // 1. Blizzard / Heavy Fog Veil during storm or high snow
+    if (isStorm || (state.weather === 'snow' && intensity > 0.75)) {
+      ctx.fillStyle = 'rgba(241, 245, 249, 0.12)';
+      ctx.fillRect(0, 0, this.width, this.height);
+    }
+
+    // 2. Multi-Depth Drifting Snowflake Particles
+    const flakeCount = Math.floor(75 + intensity * 65);
+    const windSpeed = isStorm ? -85 : -24;
+
+    for (let i = 0; i < flakeCount; i++) {
+      const depth = (i % 3); // 0 = fore (large), 1 = mid, 2 = back (small)
+      const baseFallSpeed = isStorm ? (115 + depth * 30) : (45 + depth * 16);
+      const flakeSize = depth === 0 ? 3.0 : (depth === 1 ? 2.0 : 1.2);
+
+      // Horizontal sway (gentle sinusoidal drifting in air)
+      const swayPeriod = 1.4 + (i % 4) * 0.35;
+      const swayAmp = depth === 0 ? 12 : (depth === 1 ? 8 : 4.5);
+      const sway = Math.sin(this.animTimer * swayPeriod + i * 0.45) * swayAmp;
+
+      const fx = (((i * 37.3 + this.animTimer * windSpeed + sway - camX * (0.15 + depth * 0.12)) % this.width + this.width) % this.width);
+      const fy = ((i * 19.1 + this.animTimer * baseFallSpeed) % (this.height + 20));
+
+      const flakeAlpha = depth === 0 
+        ? (isStorm ? 0.95 : 0.88) 
+        : (depth === 1 ? 0.75 : 0.55);
+
+      ctx.fillStyle = `rgba(255, 255, 255, ${flakeAlpha})`;
+      ctx.beginPath();
+      ctx.arc(fx, fy, flakeSize * 0.5, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Soft glow for large foreground flakes
+      if (depth === 0) {
+        ctx.fillStyle = 'rgba(224, 242, 254, 0.22)';
+        ctx.beginPath();
+        ctx.arc(fx, fy, flakeSize * 1.3, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      // Settling Snowflake on ground line
+      if (Math.abs(fy - gY) < 3.5) {
+        ctx.fillStyle = 'rgba(248, 250, 252, 0.65)';
+        ctx.fillRect(fx - 0.75, gY - 1, 1.5, 1);
+      }
+    }
+
+    ctx.restore();
+  }
+
   // --- Kingdom Two Crowns Water Reflection ---
 
   private drawWaterReflection(camX: number, state: GameState) {
     const ctx = this.ctx;
     const waterY = this.height - 45;
+    const isWinter = state.season === 'winter';
+    const isSummer = state.season === 'summer';
+
+    let waterColorTop = state.dayProgress > 0.55 ? '#090d16' : '#1e3a8a';
+    let waterColorBot = state.dayProgress > 0.55 ? '#020617' : '#0f172a';
+
+    if (isWinter) {
+      waterColorTop = state.dayProgress > 0.55 ? '#0f172a' : '#1e293b';
+      waterColorBot = state.dayProgress > 0.55 ? '#020617' : '#0f172a';
+    } else if (isSummer) {
+      waterColorTop = state.dayProgress > 0.55 ? '#0c1527' : '#1d4ed8';
+      waterColorBot = state.dayProgress > 0.55 ? '#020617' : '#172554';
+    }
 
     // Draw Water Strip with subtle displacement wave
     const waterGrad = ctx.createLinearGradient(0, waterY, 0, this.height);
-    waterGrad.addColorStop(0, state.dayProgress > 0.55 ? '#090d16' : '#1e3a8a');
-    waterGrad.addColorStop(1, state.dayProgress > 0.55 ? '#020617' : '#0f172a');
+    waterGrad.addColorStop(0, waterColorTop);
+    waterGrad.addColorStop(1, waterColorBot);
     ctx.fillStyle = waterGrad;
     ctx.fillRect(0, waterY, this.width, 45);
+
+    // Floating Ice Floes in Winter (Kışın Su Üzerindeki Buz Kütleleri)
+    if (this.winterProgress > 0.08) {
+      ctx.fillStyle = `rgba(241, 245, 249, ${(this.winterProgress * 0.75).toFixed(3)})`;
+      for (let ice = 0; ice < 8; ice++) {
+        const iceX = ((ice * 185 + this.animTimer * 5 - camX * 0.5) % this.width + this.width) % this.width;
+        const iceY = waterY + 4 + (ice % 3) * 6;
+        const iceW = 22 + (ice % 4) * 8;
+        ctx.fillRect(iceX, iceY, iceW, 2.5);
+      }
+    }
 
     // Inverted Shimmering Reflections of Standing Stone Monoliths (Kingdom Classic reflection)
     if (state.stoneLetters && state.stoneLetters.length > 0) {
@@ -8463,6 +10284,18 @@ export class GameRenderer {
       const ry = waterY + 6 + (i % 4) * 8;
       const len = 12 + (i % 5) * 6;
       ctx.fillRect(rx, ry, len, 1.5);
+    }
+
+    // Rain / Storm surface agitation shimmer lines
+    if (state.weather === 'rain' || state.weather === 'storm') {
+      const isStorm = state.weather === 'storm';
+      ctx.fillStyle = isStorm ? 'rgba(224, 242, 254, 0.28)' : 'rgba(191, 219, 254, 0.20)';
+      for (let r = 0; r < 24; r++) {
+        const rx = ((r * 63 + this.animTimer * 55 - camX * 0.4) % this.width + this.width) % this.width;
+        const ry = waterY + 1 + ((r * 7) % 4);
+        const rLen = 8 + (r % 4) * 8;
+        ctx.fillRect(rx, ry, rLen, 1);
+      }
     }
   }
 
@@ -8743,7 +10576,7 @@ export class GameRenderer {
     ctx.scale(facing, 1);
 
     // --- Dynamic Physics, Gait Cadence & Kinematics ---
-    const gTimer = opts?.gallopTimer ?? (this.animTimer * (isSprinting ? 9.2 : (isMoving ? 5.8 : 2.2)));
+    const gTimer = opts?.gallopTimer ?? (this.animTimer * (isSprinting ? 6.2 : (isMoving ? 4.4 : 2.2)));
     const breathCycle = Math.sin(this.animTimer * 2.2 + seed);
     
     // Vertical bobbing of torso (Kingdom Two Crowns gait feel):
@@ -8761,13 +10594,13 @@ export class GameRenderer {
     } else if (isSprinting) {
       // Gallop: smooth, grounded rhythmic canter bounce (Kingdom Two Crowns style graceful stride)
       const gCycle = gTimer % (Math.PI * 2);
-      gallopBob = -Math.sin(gCycle) * 1.5;
-      headNod = -Math.sin(gCycle) * 0.7;
-      bodyPitch = Math.cos(gCycle) * 0.025;
+      gallopBob = -Math.sin(gCycle) * 0.75;
+      headNod = -Math.sin(gCycle) * 0.45;
+      bodyPitch = Math.cos(gCycle) * 0.015;
     } else {
       // Walk / Trot: gentle rhythmic bounce
-      gallopBob = Math.sin(gTimer * 2) * 0.5;
-      headNod = Math.sin(gTimer * 2 + 0.6) * 0.35;
+      gallopBob = Math.sin(gTimer * 2) * 0.35;
+      headNod = Math.sin(gTimer * 2 + 0.6) * 0.25;
       bodyPitch = 0;
     }
 

@@ -4,6 +4,7 @@
 
 import { soundEngine } from '../audio/soundEngine';
 import { CAMPAIGN_LEVELS } from '../data/levels';
+import { hasCompletedInGameTutorial, setCompletedInGameTutorial } from '../utils/storage';
 import {
   AnimalType,
   BuildSlot,
@@ -52,12 +53,16 @@ export class GameEngine {
   private animalSpawnTimer: number = 0;
   private assignmentCheckTimer: number = 0;
   private weatherTimer: number = 0;
+  private targetWeatherIntensity: number = 0;
+  private gallopCadenceTimer: number = 0;
   private soldierIdCounter: number = 1;
   private enemyIdCounter: number = 1;
   private animalIdCounter: number = 1;
   private projIdCounter: number = 1;
   private coinIdCounter: number = 1;
   private artIdCounter: number = 1;
+  private lastRadioDay: number = 0;
+  private plannedNightWave: { flank: 'left' | 'right' | 'both'; squadSize: number; hasHeavyUnits: boolean; text: string } | null = null;
 
   constructor(levelIndex: number = 0, carriedOverSoldiers?: Array<{ role: Soldier['role']; name?: string }>) {
     const levelConfig = CAMPAIGN_LEVELS[levelIndex] || CAMPAIGN_LEVELS[0];
@@ -82,10 +87,29 @@ export class GameEngine {
       relicsCollected: [],
       cameraX: Math.max(0, (levelIndex === 0 ? (levelConfig.worldWidth / 2 - 1750) : levelConfig.worldWidth / 2) - 550),
       speedMultiplier: 1,
+      radioIntercept: {
+        isActive: false,
+        targetFrequency: 720,
+        currentFrequency: 450,
+        signalStrength: 0,
+        isDecoded: false,
+        isOpenUI: false,
+        morseTimer: 0,
+      },
     };
 
     const isChapterOne = levelIndex === 0;
     const hqX = levelConfig.worldWidth / 2;
+    if (isChapterOne) {
+      this.state.inGameTutorial = {
+        enabled: true,
+        step: 'goto_hq',
+        stepTimer: 0,
+        isStepCompleted: false,
+        fadeAlpha: 1,
+        targetX: hqX,
+      };
+    }
     // In Chapter 1, commander starts far away in the deep pine forest on the left flank (1750px away from HQ)
     // as requested ("karargahtan uzakta ormanın içinde başlasın ilk bölüm")
     const spawnX = isChapterOne ? (hqX - 1750) : hqX;
@@ -150,8 +174,8 @@ export class GameEngine {
     this.initWildAnimals(levelConfig);
     this.initStoneTitle(levelIndex);
 
-    // Initial Starting Coins placed scattered on the ground near HQ (5-6 coins ready for pickup)
-    const totalStartCoins = isChapterOne ? 6 : Math.max(6, levelConfig.startingMecidiye || (6 + levelIndex * 2));
+    // Initial Starting Coins placed scattered on the ground near HQ (ready for pickup)
+    const totalStartCoins = isChapterOne ? 8 : Math.max(6, levelConfig.startingMecidiye || (6 + levelIndex * 2));
     for (let i = 0; i < totalStartCoins; i++) {
       const scatterOffset = -90 + (i / (Math.max(1, totalStartCoins - 1))) * 180 + (Math.random() - 0.5) * 18;
       this.groundCoins.push({
@@ -263,7 +287,7 @@ export class GameEngine {
       maxHealth: 400,
       side: 'left',
       costMecidiye: 4,
-      upgradeDescription: 'Sol Sahile Hücum Taburu Akıncısı Donat (4 Sikke -> Azami 5 Nefer)',
+      upgradeDescription: 'Sol Sahile Hücum Taburu Akıncısı Donat (4 Sikke -> Azami 4 Nefer)',
       titleTr: 'Sol Taarruz Sancağı',
       assignedSoldierIds: [],
       maxSoldiers: 0,
@@ -279,7 +303,7 @@ export class GameEngine {
       maxHealth: 400,
       side: 'right',
       costMecidiye: 4,
-      upgradeDescription: 'Sağ Sahile Hücum Taburu Akıncısı Donat (4 Sikke -> Azami 5 Nefer)',
+      upgradeDescription: 'Sağ Sahile Hücum Taburu Akıncısı Donat (4 Sikke -> Azami 4 Nefer)',
       titleTr: 'Sağ Taarruz Sancağı',
       assignedSoldierIds: [],
       maxSoldiers: 0,
@@ -320,52 +344,53 @@ export class GameEngine {
       maxRifles: 6,
     });
 
-    // 3. Inner Defensive Line (Tier 1 Pre-dug Trenches & Barbed Wire - KURULU HUDUT)
+    // 3. Inner Defensive Line (Chapter 1 starts unbuilt for tutorial, later chapters start fortified)
+    const isCh1 = level.id === 1;
     this.slots.push({
       id: 'trench_0',
       x: hqX - inTrenchOff,
       type: 'trench',
-      level: 1,
+      level: isCh1 ? 0 : 1,
       maxLevel: 3,
-      health: 300,
+      health: isCh1 ? 0 : 300,
       maxHealth: 300,
       side: 'left',
-      costMecidiye: 3,
-      upgradeDescription: 'Sv. 2 Ahşap Kütük Siperini İnşa Et (3 Sikke)',
-      titleTr: 'Sv. 1 Kum Torbası Siperi',
+      costMecidiye: isCh1 ? 2 : 3,
+      upgradeDescription: isCh1 ? 'Sv. 1 Siper Kaz ve Tahkim Et (2 Sikke)' : 'Sv. 2 Ahşap Kütük Siperini İnşa Et (3 Sikke)',
+      titleTr: isCh1 ? 'Boş Siper Mevzisi' : 'Sv. 1 Kum Torbası Siperi',
       assignedSoldierIds: [],
-      maxSoldiers: 2,
+      maxSoldiers: isCh1 ? 0 : 2,
     });
 
     this.slots.push({
       id: 'trench_1',
       x: hqX + inTrenchOff,
       type: 'trench',
-      level: 1,
+      level: isCh1 ? 0 : 1,
       maxLevel: 3,
-      health: 300,
+      health: isCh1 ? 0 : 300,
       maxHealth: 300,
       side: 'right',
-      costMecidiye: 3,
-      upgradeDescription: 'Sv. 2 Ahşap Kütük Siperini İnşa Et (3 Sikke)',
-      titleTr: 'Sv. 1 Kum Torbası Siperi',
+      costMecidiye: isCh1 ? 2 : 3,
+      upgradeDescription: isCh1 ? 'Sv. 1 Siper Kaz ve Tahkim Et (2 Sikke)' : 'Sv. 2 Ahşap Kütük Siperini İnşa Et (3 Sikke)',
+      titleTr: isCh1 ? 'Boş Siper Mevzisi' : 'Sv. 1 Kum Torbası Siperi',
       assignedSoldierIds: [],
-      maxSoldiers: 2,
+      maxSoldiers: isCh1 ? 0 : 2,
     });
 
-    // Kurulu Hudut: Dikenli Tel & Kazık Engelleri
+    // Dikenli Tel & Kazık Engelleri (Chapter 1 starts unbuilt for tutorial)
     this.slots.push({
       id: 'wire_0',
       x: hqX - inWireOff,
       type: 'barbed_wire',
-      level: 1,
+      level: isCh1 ? 0 : 1,
       maxLevel: 4,
-      health: 200,
+      health: isCh1 ? 0 : 200,
       maxHealth: 200,
       side: 'left',
-      costMecidiye: 3,
-      upgradeDescription: 'Sv. 2 İspanyol Süvarisi Çapraz Kazıklar & Tel Engeli (3 Sikke)',
-      titleTr: 'Sv. 1 Dikenli Tel & Kazık Engeli',
+      costMecidiye: isCh1 ? 2 : 3,
+      upgradeDescription: isCh1 ? 'Sv. 1 Dikenli Tel ve Kazık Engeli Kur (2 Sikke)' : 'Sv. 2 İspanyol Süvarisi Çapraz Kazıklar & Tel Engeli (3 Sikke)',
+      titleTr: isCh1 ? 'Tel ve Engel Mevzisi' : 'Sv. 1 Dikenli Tel & Kazık Engeli',
       assignedSoldierIds: [],
       maxSoldiers: 0,
     });
@@ -374,14 +399,14 @@ export class GameEngine {
       id: 'wire_1',
       x: hqX + inWireOff,
       type: 'barbed_wire',
-      level: 1,
+      level: isCh1 ? 0 : 1,
       maxLevel: 4,
-      health: 200,
+      health: isCh1 ? 0 : 200,
       maxHealth: 200,
       side: 'right',
-      costMecidiye: 3,
-      upgradeDescription: 'Sv. 2 İspanyol Süvarisi Çapraz Kazıklar & Tel Engeli (3 Sikke)',
-      titleTr: 'Sv. 1 Dikenli Tel & Kazık Engeli',
+      costMecidiye: isCh1 ? 2 : 3,
+      upgradeDescription: isCh1 ? 'Sv. 1 Dikenli Tel ve Kazık Engeli Kur (2 Sikke)' : 'Sv. 2 İspanyol Süvarisi Çapraz Kazıklar & Tel Engeli (3 Sikke)',
+      titleTr: isCh1 ? 'Tel ve Engel Mevzisi' : 'Sv. 1 Dikenli Tel & Kazık Engeli',
       assignedSoldierIds: [],
       maxSoldiers: 0,
     });
@@ -927,19 +952,16 @@ export class GameEngine {
     ];
 
     // Bölüme göre yadigar sayısı belirleme:
-    // - 1. Bölüm: Bazen 1, bazen 2 yadigar (rastgele)
-    // - 2. Bölüm: 2 yadigar (rastgele)
-    // - Diğer Bölümler (3 ve 4): Bölüm zorluğuna göre 2 veya 3 yadigar (rastgele)
+    // - 1. Bölüm: 1 adet yadigar
+    // - 2. Bölüm: Bazen 1, bazen 2 yadigar (rastgele)
+    // - Diğer Bölümler: 2 adet yadigar (asla aynı bölümde 2 aynı yadigar tekrar etmez)
     let relicCount = 2;
     if (level.id === 1) {
-      relicCount = Math.random() < 0.5 ? 1 : 2;
+      relicCount = 1;
     } else if (level.id === 2) {
-      relicCount = 2;
-    } else if (level.id === 3) {
-      relicCount = Math.random() < 0.5 ? 2 : 3;
+      relicCount = Math.random() < 0.5 ? 1 : 2;
     } else {
-      // 4. Bölüm ve yukarısı: Büyük cephe, %65 ihtimalle 3, %35 ihtimalle 2
-      relicCount = Math.random() < 0.35 ? 2 : 3;
+      relicCount = 2;
     }
 
     // AYNI YADİGARDAN 2 TANE OLMAMASI İÇİN Fisher-Yates karıştırma ve tekleme:
@@ -953,23 +975,35 @@ export class GameEngine {
     // Seçilen benzersiz yadigarlar (asla tekrar etmez)
     const selectedRelics = shuffledTemplates.slice(0, relicCount);
 
-    // Konumlandırma koordinatları (haritadaki açık ve ferah keşif noktaları):
-    // 1 adet ise: Sol veya sağ keşif hattı (rastgele)
-    // 2 adet ise: Biri sol kanatta (hqX - 3150), biri sağ kanatta (hqX + 3150)
-    // 3 adet ise: Sol kanat (hqX - 3150), Sağ kanat (hqX + 3150), Derin keşif mevkii (hqX +/- 5100)
+    // Konumlandırma koordinatları (haritadaki açık ve ferah keşif mevkileri - rastgele kanat ve mesafe):
+    // 1 adet ise: Sol veya sağ taraf rastgele seçilir (2400-3200px mesafe)
+    // 2 adet ise: Biri sol kanatta, biri sağ kanatta rastgele dağıtılır
     const relicPositions: number[] = [];
     if (relicCount === 1) {
       const sideSign = Math.random() < 0.5 ? -1 : 1;
-      relicPositions.push(hqX + sideSign * 3150);
+      const randDist = 2400 + Math.floor(Math.random() * 900);
+      relicPositions.push(Math.max(450, Math.min(w - 450, hqX + sideSign * randDist)));
     } else if (relicCount === 2) {
-      relicPositions.push(hqX - 3150);
-      relicPositions.push(hqX + 3150);
+      const leftDist = 2300 + Math.floor(Math.random() * 900);
+      const rightDist = 2300 + Math.floor(Math.random() * 900);
+      const leftPos = Math.max(450, hqX - leftDist);
+      const rightPos = Math.min(w - 450, hqX + rightDist);
+      // Hangi yadigârın sola, hangisinin sağa düşeceği de rastgele karıştırılır
+      if (Math.random() < 0.5) {
+        relicPositions.push(leftPos);
+        relicPositions.push(rightPos);
+      } else {
+        relicPositions.push(rightPos);
+        relicPositions.push(leftPos);
+      }
     } else {
-      relicPositions.push(hqX - 3150);
-      relicPositions.push(hqX + 3150);
+      const leftDist = 2300 + Math.floor(Math.random() * 700);
+      const rightDist = 2300 + Math.floor(Math.random() * 700);
+      relicPositions.push(Math.max(450, hqX - leftDist));
+      relicPositions.push(Math.min(w - 450, hqX + rightDist));
       const deepSide = Math.random() < 0.5 ? -1 : 1;
-      const deepDist = Math.min(w / 2 - 800, 5000);
-      relicPositions.push(hqX + deepSide * deepDist);
+      const deepDist = Math.min(w / 2 - 600, 4200 + Math.random() * 800);
+      relicPositions.push(Math.max(350, Math.min(w - 350, hqX + deepSide * deepDist)));
     }
 
     // Seviye konfigürasyonundaki mevcut yadigarları da senkronize et
@@ -1207,8 +1241,219 @@ export class GameEngine {
     // 10. Update Particles & Floating Text
     this.updateParticles(scaledDt);
 
+    // 10.5 Update In-Game Tutorial
+    this.updateInGameTutorial(scaledDt, moveDir, isSprinting);
+
     // 11. Check Victory & Defeat Conditions
     this.checkGameConditions();
+  }
+
+  private updateInGameTutorial(dt: number, _moveDir: number, _isSprinting: boolean) {
+    const tut = this.state.inGameTutorial;
+    if (!tut || !tut.enabled) return;
+
+    tut.stepTimer += dt;
+    const hqX = this.state.level.worldWidth / 2;
+
+    // Safeguard for Chapter 1 tutorial: If player has less than 2 coins and needs to build/chop, spawn safety coin at HQ so player never gets soft-locked
+    if (tut.enabled && tut.step !== 'goto_hq' && tut.step !== 'collect_coins' && tut.step !== 'done' && tut.step !== 'use_whistle') {
+      const hqCoins = this.groundCoins.filter((c) => Math.abs(c.x - hqX) < 220).length;
+      if (this.commander.mecidiye < 2 && hqCoins === 0) {
+        this.spawnGroundCoin(hqX, 2, false, 0.2);
+        this.addFloatingText(hqX, 360, '🪙 İkmal Sandığından 2 İlave Sikke Geldi!', '#fbbf24');
+      }
+    }
+
+    switch (tut.step) {
+      case 'goto_hq': {
+        tut.targetX = hqX;
+        const dist = Math.abs(this.commander.x - hqX);
+        if (!tut.isStepCompleted) {
+          if (dist < 140) {
+            tut.isStepCompleted = true;
+            tut.stepTimer = 0;
+            soundEngine.playCoinCollect();
+          }
+        } else if (tut.stepTimer >= 0.7) {
+          tut.step = 'collect_coins';
+          tut.isStepCompleted = false;
+          tut.stepTimer = 0;
+        }
+        break;
+      }
+      case 'collect_coins': {
+        tut.targetX = hqX;
+        if (!tut.isStepCompleted) {
+          if (this.commander.mecidiye >= 3) {
+            tut.isStepCompleted = true;
+            tut.stepTimer = 0;
+            soundEngine.playCoinCollect();
+          }
+        } else if (tut.stepTimer >= 0.7) {
+          tut.step = 'buy_rifle';
+          tut.isStepCompleted = false;
+          tut.stepTimer = 0;
+        }
+        break;
+      }
+      case 'buy_rifle': {
+        const armory = this.slots.find((s) => s.type === 'armory');
+        if (armory) tut.targetX = armory.x;
+        if (!tut.isStepCompleted) {
+          const hasRifleBought = this.slots.some((s) => s.type === 'armory' && ((s.availableRifles || 0) > 0 || (s.coinsDeposited || 0) > 0)) ||
+            this.soldiers.some((s) => s.role === 'infantry');
+          if (hasRifleBought) {
+            tut.isStepCompleted = true;
+            tut.stepTimer = 0;
+            soundEngine.playCoinCollect();
+          }
+        } else if (tut.stepTimer >= 0.7) {
+          tut.step = 'recruit_soldier';
+          tut.isStepCompleted = false;
+          tut.stepTimer = 0;
+        }
+        break;
+      }
+      case 'recruit_soldier': {
+        const villageSlots = this.slots.filter((s) => s.type === 'recruit_camp');
+        if (villageSlots.length > 0) {
+          let nearest = villageSlots[0];
+          let minDist = Math.abs(this.commander.x - nearest.x);
+          for (const s of villageSlots) {
+            const d = Math.abs(this.commander.x - s.x);
+            if (d < minDist) {
+              minDist = d;
+              nearest = s;
+            }
+          }
+          tut.targetX = nearest.x;
+        }
+        if (!tut.isStepCompleted) {
+          const hasRecruited = this.soldiers.length > 2 ||
+            this.slots.some((s) => s.type === 'recruit_camp' && ((s.coinsDeposited || 0) > 0 || (s.recruitsSpawnedTotal || 0) > 0));
+          if (hasRecruited) {
+            tut.isStepCompleted = true;
+            tut.stepTimer = 0;
+            soundEngine.playCoinCollect();
+          }
+        } else if (tut.stepTimer >= 0.7) {
+          tut.step = 'chop_tree';
+          tut.isStepCompleted = false;
+          tut.stepTimer = 0;
+        }
+        break;
+      }
+      case 'chop_tree': {
+        const uncutTrees = this.slots.filter((s) => s.type === 'scavenge_wood' && !s.isScavenged);
+        if (uncutTrees.length > 0) {
+          let nearest = uncutTrees[0];
+          let minDist = Math.abs(this.commander.x - nearest.x);
+          for (const t of uncutTrees) {
+            const d = Math.abs(this.commander.x - t.x);
+            if (d < minDist) {
+              minDist = d;
+              nearest = t;
+            }
+          }
+          tut.targetX = nearest.x;
+        }
+        if (!tut.isStepCompleted) {
+          const hasMarkedTree = this.slots.some((s) => s.type === 'scavenge_wood' && (s.isMarkedForChop || s.isScavenged));
+          if (hasMarkedTree) {
+            tut.isStepCompleted = true;
+            tut.stepTimer = 0;
+            soundEngine.playCoinCollect();
+          }
+        } else if (tut.stepTimer >= 0.7) {
+          tut.step = 'build_trench';
+          tut.isStepCompleted = false;
+          tut.stepTimer = 0;
+        }
+        break;
+      }
+      case 'build_trench': {
+        const trenchSlots = this.slots.filter((s) => s.type === 'trench');
+        if (trenchSlots.length > 0) {
+          let nearest = trenchSlots[0];
+          let minDist = Math.abs(this.commander.x - nearest.x);
+          for (const s of trenchSlots) {
+            const d = Math.abs(this.commander.x - s.x);
+            if (d < minDist) {
+              minDist = d;
+              nearest = s;
+            }
+          }
+          tut.targetX = nearest.x;
+        }
+        if (!tut.isStepCompleted) {
+          const hasBuiltTrench = this.slots.some((s) => s.type === 'trench' && (s.underConstruction || s.level > 0 || (s.coinsDeposited || 0) > 0));
+          if (hasBuiltTrench) {
+            tut.isStepCompleted = true;
+            tut.stepTimer = 0;
+            soundEngine.playCoinCollect();
+          }
+        } else if (tut.stepTimer >= 0.7) {
+          tut.step = 'build_wire';
+          tut.isStepCompleted = false;
+          tut.stepTimer = 0;
+        }
+        break;
+      }
+      case 'build_wire': {
+        const wireSlots = this.slots.filter((s) => s.type === 'barbed_wire');
+        if (wireSlots.length > 0) {
+          let nearest = wireSlots[0];
+          let minDist = Math.abs(this.commander.x - nearest.x);
+          for (const s of wireSlots) {
+            const d = Math.abs(this.commander.x - s.x);
+            if (d < minDist) {
+              minDist = d;
+              nearest = s;
+            }
+          }
+          tut.targetX = nearest.x;
+        }
+        if (!tut.isStepCompleted) {
+          const hasBuiltWire = this.slots.some((s) => s.type === 'barbed_wire' && (s.underConstruction || s.level > 0 || (s.coinsDeposited || 0) > 0));
+          if (hasBuiltWire) {
+            tut.isStepCompleted = true;
+            tut.stepTimer = 0;
+            soundEngine.playCoinCollect();
+          }
+        } else if (tut.stepTimer >= 0.7) {
+          tut.step = 'use_whistle';
+          tut.isStepCompleted = false;
+          tut.stepTimer = 0;
+        }
+        break;
+      }
+      case 'use_whistle': {
+        tut.targetX = undefined;
+        if (!tut.isStepCompleted) {
+          if (this.commander.activeBuff || this.commander.whistleCooldown > 0) {
+            tut.isStepCompleted = true;
+            tut.stepTimer = 0;
+            soundEngine.playVictoryFanfare();
+          }
+        } else if (tut.stepTimer >= 0.8) {
+          tut.step = 'done';
+          tut.isStepCompleted = true;
+          tut.stepTimer = 0;
+          setCompletedInGameTutorial(true);
+        }
+        break;
+      }
+      case 'done': {
+        tut.targetX = undefined;
+        if (tut.stepTimer >= 3.5) {
+          tut.fadeAlpha = Math.max(0, 1 - (tut.stepTimer - 3.5) / 1.0);
+          if (tut.fadeAlpha <= 0) {
+            tut.enabled = false;
+          }
+        }
+        break;
+      }
+    }
   }
 
   private updateTimeAndWeather(dt: number) {
@@ -1218,10 +1463,10 @@ export class GameEngine {
 
     // Advance time during daytime normally.
     // Gece kuralı: "düşman askerler bitmeden veya taaruz bitmeden gece bitmesin tüm askerler bitince gündüz olsun."
-    // All night waves must have spawned AND all alive enemies must be eliminated AND player assault squads completed!
+    // All night waves must have spawned AND all alive enemies must be eliminated AND player charging squads completed!
     const allWavesSpawned = this.nightWavesSpawnedCount >= this.maxNightWaves;
-    const anyAssaultActive = this.soldiers.some((s) => s.isAssaultSquad);
-    const nightEnemiesCleared = allWavesSpawned && !this.enemies.some((e) => e.health > 0 && e.state !== 'dying') && !anyAssaultActive;
+    const anyChargingAssault = this.soldiers.some((s) => s.isAssaultSquad && s.assaultState === 'charging');
+    const nightEnemiesCleared = allWavesSpawned && !this.enemies.some((e) => e.health > 0 && e.state !== 'dying') && !anyChargingAssault;
 
     if (!isNight) {
       this.state.dayProgress += dt / dayDuration;
@@ -1230,10 +1475,10 @@ export class GameEngine {
       if (this.state.dayProgress < 0.87) {
         this.state.dayProgress += dt / (dayDuration * 0.45);
       }
-      // Night NEVER advances beyond midnight while any enemy is alive or taarruz is ongoing!
+      // Night NEVER advances beyond midnight while any enemy is alive or charging assault is ongoing!
       if (nightEnemiesCleared) {
-        // As soon as all enemies are eliminated, advance into dawn at a gentle, majestic pace (takes ~10 seconds of peaceful continuous moonset)
-        this.state.dayProgress = Math.min(1.0, this.state.dayProgress + dt * 0.013);
+        // As soon as all enemies are eliminated, advance into dawn at a gentle, majestic pace
+        this.state.dayProgress = Math.min(1.0, this.state.dayProgress + dt * 0.015);
       }
     }
 
@@ -1257,6 +1502,14 @@ export class GameEngine {
       const seasons: SeasonType[] = ['spring', 'summer', 'autumn', 'winter'];
       const currentSeasonIndex = Math.floor((this.state.dayNumber - 1) / 2) % seasons.length;
       this.state.season = seasons[currentSeasonIndex];
+
+      if (this.state.radioIntercept) {
+        this.state.radioIntercept.isActive = false;
+        this.state.radioIntercept.isDecoded = false;
+        this.state.radioIntercept.isOpenUI = false;
+        this.state.radioIntercept.intelReport = undefined;
+      }
+      this.plannedNightWave = null;
     }
 
     // Determine Time Phase (Extended daytime for scouting, hunting & building)
@@ -1276,18 +1529,37 @@ export class GameEngine {
       this.state.timePhase = 'midnight';
     }
 
+    // Sabah olunca istihbarat HUD'ı ve telsiz modalı kapanır (Kullanıcı: "sabah olunca istihbarat hudu kapanmadı")
+    if (this.state.timePhase === 'dawn' || this.state.timePhase === 'day') {
+      if (this.state.radioIntercept) {
+        this.state.radioIntercept.isActive = false;
+        this.state.radioIntercept.isDecoded = false;
+        this.state.radioIntercept.isOpenUI = false;
+        this.state.radioIntercept.intelReport = undefined;
+      }
+      this.plannedNightWave = null;
+    }
+
     // Dusk Warning Alert: When evening arrives, warn the commander and signal soldiers behind frontier!
     if (this.state.timePhase === 'dusk' && this.prevTimePhase !== 'dusk') {
       soundEngine.playBugleCharge();
       this.addFloatingText(this.commander.x, 340, '🌆 Akşam Oluyor! Askerler Hudut Gerisinde Savunma Mevzilerine Geçiyor!', '#f59e0b');
     }
 
+    // Her gecede (1. gece, 2. gece, vb.) telsiz istihbarat sinyali yakalanır (Kullanıcı: "2. gecede telsiz gelmedi")
+    const isEveningOrNight = this.state.timePhase === 'dusk' || this.state.timePhase === 'night' || this.state.timePhase === 'midnight';
+    if (isEveningOrNight && this.lastRadioDay !== this.state.dayNumber) {
+      this.lastRadioDay = this.state.dayNumber;
+      this.plannedNightWave = null;
+      this.prepareNightRadioIntercept();
+    }
+
     // Music Transitions & Nightfall Warning Alert
     if (this.state.timePhase === 'night' || this.state.timePhase === 'midnight') {
       soundEngine.playMusic('night');
-      if (this.prevTimePhase !== 'night' && this.prevTimePhase !== 'midnight' && this.prevTimePhase !== 'dusk') {
+      if (this.prevTimePhase !== 'night' && this.prevTimePhase !== 'midnight') {
         this.nightWavesSpawnedCount = 0;
-        this.maxNightWaves = Math.min(3, 1 + Math.floor((this.state.dayNumber - 1) / 3));
+        this.maxNightWaves = 1;
         soundEngine.playBugleCharge();
         const isBloodMoon = this.state.dayNumber % 3 === 0;
         const msg = isBloodMoon
@@ -1337,16 +1609,146 @@ export class GameEngine {
       this.recheckSoldierAssignments();
     }
 
-    // Dynamic Weather Changes
+    // Dynamic Weather Changes & Atmospheric Fog / Rain Transitions
     this.weatherTimer += dt;
-    if (this.weatherTimer > 40) {
+    // Smooth weather intensity ramp
+    if (Math.abs(this.targetWeatherIntensity - this.state.weatherIntensity) > 0.005) {
+      const blend = 1 - Math.exp(-1.4 * dt);
+      this.state.weatherIntensity += (this.targetWeatherIntensity - this.state.weatherIntensity) * blend;
+      soundEngine.updateWeatherAmbience(this.state.weather, this.state.weatherIntensity);
+    }
+
+    // Kar hava durumu kesinlikle sadece kış mevsiminde çalışabilir
+    if (this.state.season !== 'winter' && this.state.weather === 'snow') {
+      this.state.weather = 'rain';
+    }
+
+    if (this.weatherTimer > 35) {
       this.weatherTimer = 0;
-      if (Math.random() < 0.35) {
-        const weathers: WeatherType[] = this.state.season === 'winter' ? ['snow', 'storm', 'clear'] : ['rain', 'fog', 'storm', 'clear'];
-        this.state.weather = weathers[Math.floor(Math.random() * weathers.length)];
-        this.state.weatherIntensity = 0.6;
-        soundEngine.updateWeatherAmbience(this.state.weather, this.state.weatherIntensity);
+      if (this.state.weather === 'clear') {
+        const roll = Math.random();
+        // Early morning / dawn has higher likelihood of coastal mist / fog
+        const isDawnOrDusk = this.state.timePhase === 'dawn' || this.state.timePhase === 'dusk';
+        if (roll < (isDawnOrDusk ? 0.45 : 0.26)) {
+          this.state.weather = 'fog';
+          this.targetWeatherIntensity = 0.5 + Math.random() * 0.45;
+        } else if (roll < 0.60) {
+          this.state.weather = this.state.season === 'winter' ? 'snow' : 'rain';
+          this.targetWeatherIntensity = 0.4 + Math.random() * 0.45;
+        }
+      } else {
+        // If weather is already fog or rain, 60% chance to clear up smoothly
+        if (Math.random() < 0.60) {
+          this.targetWeatherIntensity = 0;
+          if (this.state.weatherIntensity < 0.08) {
+            this.state.weather = 'clear';
+          }
+        }
       }
+      soundEngine.updateWeatherAmbience(this.state.weather, this.state.weatherIntensity);
+    }
+  }
+
+  public prepareNightRadioIntercept() {
+    if (!this.state.radioIntercept) {
+      this.state.radioIntercept = {
+        isActive: false,
+        targetFrequency: 720,
+        currentFrequency: 450,
+        signalStrength: 0,
+        isDecoded: false,
+        isOpenUI: false,
+        morseTimer: 0,
+      };
+    }
+
+    if (this.plannedNightWave) return;
+
+    const isBloodMoon = this.state.dayNumber % 3 === 0;
+
+    // Pick flank
+    let flank: 'left' | 'right' | 'both';
+    if (isBloodMoon || Math.random() < 0.35 + this.state.dayNumber * 0.1) {
+      flank = 'both';
+    } else {
+      flank = Math.random() < 0.5 ? 'left' : 'right';
+    }
+
+    const leftCamp = this.landingCamps.find((c) => c.side === 'left');
+    const rightCamp = this.landingCamps.find((c) => c.side === 'right');
+    if (flank === 'left' && leftCamp && leftCamp.isDestroyed) flank = 'right';
+    if (flank === 'right' && rightCamp && rightCamp.isDestroyed) flank = 'left';
+
+    const squadSize = this.state.dayNumber === 1
+      ? 5
+      : Math.min(20, 5 + Math.floor(this.state.dayNumber * 1.8) + (isBloodMoon ? 5 : 0));
+    const totalCount = flank === 'both' ? squadSize * 2 : squadSize;
+    const hasHeavyUnits = this.state.dayNumber >= 3;
+
+    let text = '';
+    if (flank === 'left') {
+      text = `İngiliz Anzac Kolordusu telsiz emri çözüldü: "Sol kanat (Arıburnu yönü) siperlerine ${totalCount} neferlik taarruz tertibatı alındı. Sağ cenaha takviye yoktur."`;
+    } else if (flank === 'right') {
+      text = `İngiliz 29. Tümen şifresi çözüldü: "Sağ cenah (Seddülbahir yönü) mevzilerine ${totalCount} kişilik gece hücumu başlatılacaktır. Sol cenaha takviye yoktur."`;
+    } else {
+      text = `Müttefik Karargâh telsiz şifresi çözüldü: "Her iki cenaha eş zamanlı kıskaç hücumu icra edilsin! Toplam ${totalCount} asker (${squadSize} sol, ${squadSize} sağ) sevk edildi."`;
+    }
+
+    const possibleFreqs = [520, 620, 680, 740, 820, 880, 940, 1020, 1100];
+    const targetFreq = possibleFreqs[Math.floor(Math.random() * possibleFreqs.length)];
+
+    this.plannedNightWave = {
+      flank,
+      squadSize,
+      hasHeavyUnits,
+      text,
+    };
+
+    this.state.radioIntercept.isActive = true;
+    this.state.radioIntercept.isDecoded = false;
+    this.state.radioIntercept.targetFrequency = targetFreq;
+    this.state.radioIntercept.currentFrequency = 450;
+    this.state.radioIntercept.signalStrength = 0;
+    this.state.radioIntercept.intelReport = {
+      text,
+      flank,
+      enemyCount: totalCount,
+      hasHeavyUnits,
+      timestamp: Date.now(),
+    };
+
+    soundEngine.playRadioChatter();
+    this.addFloatingText(this.commander.x, 360, '📻 Düşman Telsiz Sinyali Yakalandı! [T] ile Şifreyi Çözün', '#38bdf8');
+  }
+
+  public tuneRadioFrequency(freq: number) {
+    if (!this.state.radioIntercept) return;
+    this.state.radioIntercept.currentFrequency = freq;
+    const diff = Math.abs(freq - this.state.radioIntercept.targetFrequency);
+    this.state.radioIntercept.signalStrength = Math.max(0, 1 - diff / 90);
+  }
+
+  public decodeRadioSignal() {
+    if (!this.state.radioIntercept) return;
+    this.state.radioIntercept.isDecoded = true;
+    this.state.radioIntercept.signalStrength = 1.0;
+    soundEngine.playRadioDecode();
+    const rep = this.state.radioIntercept.intelReport;
+    if (rep) {
+      const flankName = rep.flank === 'left' ? 'SOL KANAT' : rep.flank === 'right' ? 'SAĞ KANAT' : 'HER İKİ KANAT';
+      this.addFloatingText(this.commander.x, 320, `🎯 ŞİFRE ÇÖZÜLDÜ! Düşman ${flankName}tan saldıracak (${rep.enemyCount} er)!`, '#4ade80');
+    }
+  }
+
+  public toggleRadioTelegraph(open?: boolean) {
+    if (!this.state.radioIntercept) return;
+    if (open !== undefined) {
+      this.state.radioIntercept.isOpenUI = open;
+    } else {
+      this.state.radioIntercept.isOpenUI = !this.state.radioIntercept.isOpenUI;
+    }
+    if (this.state.radioIntercept.isOpenUI) {
+      soundEngine.playRadioChatter();
     }
   }
 
@@ -1391,7 +1793,7 @@ export class GameEngine {
       if (nearHospital || nearHQ) {
         if (Math.random() < 0.35 * dt) {
           cmd.health = Math.min(cmd.maxHealth, cmd.health + 1);
-          soundEngine.playCoin();
+          soundEngine.playHeal();
           this.addFloatingText(cmd.x, 360, `💚 +1 Can (${cmd.health}/${cmd.maxHealth}) - Sıhhiye Tedavisi`, '#22c55e');
           this.spawnDebris(cmd.x, 420, '#22c55e', 4);
         }
@@ -1457,11 +1859,17 @@ export class GameEngine {
       cmd.vx = 0;
       cmd.isSprinting = false;
       cmd.state = 'idle';
+      this.gallopCadenceTimer = 0;
     } else {
       if (moveDir > 0) cmd.facing = 1;
       else if (moveDir < 0) cmd.facing = -1;
       cmd.state = cmd.isSprinting ? 'galloping' : 'walking';
-      if (Math.random() < 0.08) {
+      
+      // Rhythmic horse hoof cadence: synchronized with horse gait cycle without random audio bursts
+      this.gallopCadenceTimer += dt;
+      const cadenceInterval = cmd.isSprinting ? 0.24 : 0.44;
+      if (this.gallopCadenceTimer >= cadenceInterval) {
+        this.gallopCadenceTimer = 0;
         soundEngine.playGallop();
       }
 
@@ -1534,8 +1942,16 @@ export class GameEngine {
     const currentActive = this.activeSlotNearCommander;
     let bestSlot: BuildSlot | null = null;
     let bestDist = 9999;
+    let hqTier = 1;
+    for (let i = 0; i < this.slots.length; i++) {
+      if (this.slots[i].id === 'hq_main') {
+        hqTier = this.slots[i].level;
+        break;
+      }
+    }
 
-    for (const slot of this.slots) {
+    for (let i = 0; i < this.slots.length; i++) {
+      const slot = this.slots[i];
       // Exclude already completed / scavenged / claimed slots so they never stay selected!
       if (slot.isScavenged) continue;
       if (slot.relicClaimed) continue;
@@ -1544,9 +1960,8 @@ export class GameEngine {
       if (slot.type === 'armory' && (slot.availableRifles ?? 0) >= (slot.maxRifles ?? 6) && slot.health >= slot.maxHealth) {
         continue;
       }
-      if (slot.type === 'assault_banner') {
-        const hq = this.slots.find((s) => s.id === 'hq_main');
-        if (!hq || hq.level < 3) continue;
+      if (slot.type === 'assault_banner' && hqTier < 3) {
+        continue;
       }
 
       if (
@@ -1574,8 +1989,8 @@ export class GameEngine {
     this.activeSlotNearCommander = bestSlot;
 
     // Kingdom Refund Mechanic: If commander walks away from a slot before completing deposit, refund the coins back to the ground
-    // as requested ("sikke yerleştirmeden vazgeçmeyi de bozmuşsun onu da düzelt", "otlayan ata sikke bırakıp tamamlamadan iptal ettiğim zaman sikkeler geri düşmüyor onu da savunmalardaki gibi yap")
-    for (const slot of this.slots) {
+    for (let i = 0; i < this.slots.length; i++) {
+      const slot = this.slots[i];
       if (slot.type === 'recruit_camp' || slot.type === 'scavenge_wood') continue;
       if (slot.coinsDeposited && slot.coinsDeposited > 0 && !slot.underConstruction) {
         const dist = Math.abs(slot.x - cmd.x);
@@ -1590,11 +2005,16 @@ export class GameEngine {
     }
 
     // Manual Hold Interact Logic (Instant trigger on keypress)
-    if (this.isHoldingInteract && this.activeSlotNearCommander) {
-      this.interactHoldTimer += dt;
-      if (this.interactHoldTimer >= 0.22) {
+    if (this.isHoldingInteract) {
+      if (this.sendAssaultSquadToOtherCamp()) {
         this.interactHoldTimer = 0;
-        this.executeSlotAction(this.activeSlotNearCommander);
+        this.isHoldingInteract = false;
+      } else if (this.activeSlotNearCommander) {
+        this.interactHoldTimer += dt;
+        if (this.interactHoldTimer >= 0.22) {
+          this.interactHoldTimer = 0;
+          this.executeSlotAction(this.activeSlotNearCommander);
+        }
       }
     } else {
       this.interactHoldTimer = 0;
@@ -1630,13 +2050,15 @@ export class GameEngine {
   }
 
   public getForestEdges(): { leftForestEdgeX: number; rightForestEdgeX: number } {
-    const hqX = this.state.level.worldWidth / 2;
-    const leftTrees = this.slots.filter((s) => s.type === 'scavenge_wood' && s.side === 'left' && !s.isScavenged);
-    const rightTrees = this.slots.filter((s) => s.type === 'scavenge_wood' && s.side === 'right' && !s.isScavenged);
-
-    const leftForestEdgeX = leftTrees.length > 0 ? Math.max(...leftTrees.map((t) => t.x)) : 100;
-    const rightForestEdgeX = rightTrees.length > 0 ? Math.min(...rightTrees.map((t) => t.x)) : this.state.level.worldWidth - 100;
-
+    let leftForestEdgeX = 100;
+    let rightForestEdgeX = this.state.level.worldWidth - 100;
+    for (let i = 0; i < this.slots.length; i++) {
+      const s = this.slots[i];
+      if (s.type === 'scavenge_wood' && !s.isScavenged) {
+        if (s.side === 'left' && s.x > leftForestEdgeX) leftForestEdgeX = s.x;
+        if (s.side === 'right' && s.x < rightForestEdgeX) rightForestEdgeX = s.x;
+      }
+    }
     return { leftForestEdgeX, rightForestEdgeX };
   }
 
@@ -1688,9 +2110,9 @@ export class GameEngine {
     const targetCamX = this.commander.x - halfWidth;
     const maxCamX = Math.max(0, this.state.level.worldWidth - this.viewWidth);
     const clampedCamX = Math.max(0, Math.min(maxCamX, targetCamX));
-    // High-precision frame-rate independent camera smoothing (eliminates stutter during sprinting)
-    const blend = 1 - Math.exp(-14 * dt);
-    this.state.cameraX += (clampedCamX - this.state.cameraX) * blend;
+    // Direct, rock-solid camera tracking centered on commander (Kingdom Classic / Two Crowns style)
+    // Eliminates all micro-stutter, frame-rate lag oscillations and screen vibrating during running/sprinting
+    this.state.cameraX = clampedCamX;
   }
 
   // --- Ground Coins Management (Kingdom style) ---
@@ -1724,6 +2146,14 @@ export class GameEngine {
   private updateGroundCoins(dt: number) {
     const groundY = 440;
     const cmd = this.commander;
+    const hqX = this.state.level.worldWidth / 2;
+
+    // Defense perimeter: coins inside the base perimeter are exclusively for the Commander
+    const defSlots = this.slots.filter((s) => s.level > 0 && !s.underConstruction && (s.type === 'trench' || s.type === 'barbed_wire' || s.type === 'machine_gun' || s.type === 'artillery'));
+    const leftDefs = defSlots.filter((s) => s.side === 'left');
+    const rightDefs = defSlots.filter((s) => s.side === 'right');
+    const leftmostDefX = leftDefs.length > 0 ? leftDefs.reduce((min, s) => s.x < min.x ? s : min, leftDefs[0]).x : hqX - 350;
+    const rightmostDefX = rightDefs.length > 0 ? rightDefs.reduce((max, s) => s.x > max.x ? s : max, rightDefs[0]).x : hqX + 350;
 
     for (const coin of this.groundCoins) {
       coin.life -= dt;
@@ -1772,12 +2202,22 @@ export class GameEngine {
       }
 
       // Friendly soldiers pick up ground coins (Kingdom Classic mechanic)
-      // User: "kumandan gelince sikkeleri yere dökmesi bozulmuş onu düzelt. sikke verme de bozulmuş yere atsınlar kingdomdaki gibi kumandanın zaten manyetik çekimi var"
-      // CRITICAL: If Commander is nearby (distToCmd < 90), Commander has absolute priority!
-      // Friendly soldiers never re-absorb coins meant for the Commander!
-      if (canBePickedUp && coin.life > 0 && distToCmd >= 90) {
+      // CRITICAL RULES to prevent continuous coin pickup loops and phantom sounds:
+      // 1. If Commander is nearby (distToCmd < 90), Commander has absolute priority!
+      // 2. Soldiers NEVER pick up coins that are inside the base/Karargâh perimeter! All coins at base are for the Commander.
+      // 3. Only active daytime hunters outside base can pick up coins (no recruits, engineers, or garrisoned troops).
+      // 4. Sound effect only plays if near Commander/Camera so player doesn't hear distant pickups ("ben ilerdeyken").
+      const isCoinInsideBase = (coin.x >= leftmostDefX - 30 && coin.x <= rightmostDefX + 30);
+      if (canBePickedUp && coin.life > 0 && distToCmd >= 90 && !isCoinInsideBase) {
         for (const soldier of this.soldiers) {
-          if (soldier.health > 0 && soldier.state !== 'dying') {
+          if (
+            soldier.health > 0 &&
+            soldier.state !== 'dying' &&
+            (soldier.role === 'infantry' || soldier.role === 'sniper') &&
+            !soldier.assignedSlotId &&
+            !soldier.isRetinue &&
+            !soldier.isAssaultSquad
+          ) {
             const sY = soldier.y ?? groundY;
             const distToSoldier = Math.abs(coin.x - soldier.x);
             const dyToSoldier = Math.abs(coin.y - sY);
@@ -1794,7 +2234,10 @@ export class GameEngine {
             if (canCarry && distToSoldier < 28 && dyToSoldier < 35) {
               soldier.coinsHeld = (soldier.coinsHeld || 0) + 1;
               coin.life = 0; // mark collected
-              soundEngine.playCoin();
+              // Spatial audio: only play sound if within audible range of the commander/camera
+              if (Math.abs(soldier.x - cmd.x) < 600) {
+                soundEngine.playCoin();
+              }
               this.addFloatingText(soldier.x, sY - 32, `🪙 +1 (${soldier.coinsHeld})`, '#fbbf24');
               break;
             }
@@ -1823,7 +2266,14 @@ export class GameEngine {
       }
     }
 
-    this.groundCoins = this.groundCoins.filter((c) => c.life > 0);
+    let coinWrite = 0;
+    for (let i = 0; i < this.groundCoins.length; i++) {
+      const c = this.groundCoins[i];
+      if (c.life > 0) {
+        this.groundCoins[coinWrite++] = c;
+      }
+    }
+    this.groundCoins.length = coinWrite;
   }
 
   // --- Wild Animals Simulation & Daytime Hunting ---
@@ -1879,42 +2329,60 @@ export class GameEngine {
         animal.facing = -1;
       }
 
-      // Soldier Hunting AI: friendly armed soldiers shoot roaming animals in range day or night for coins!
+      // Soldier Hunting AI: friendly armed soldiers aim rifle before firing at roaming animals in range
       if (animal.health > 0) {
         for (const soldier of this.soldiers) {
           // Unarmed soldiers (recruits, medics) cannot hunt! Only armed infantry & snipers can hunt with rifles
           const isArmed = soldier.role === 'infantry' || soldier.role === 'sniper';
-          if (isArmed && soldier.attackCooldown <= 0 && soldier.state !== 'digging') {
+          if (isArmed && soldier.state !== 'digging' && soldier.state !== 'dying') {
             const dist = Math.abs(soldier.x - animal.x);
             const huntRange = soldier.role === 'sniper' ? 450 : 220;
             if (dist < huntRange) {
-              soldier.attackCooldown = soldier.role === 'sniper' ? 1.8 : 1.2;
               soldier.facing = animal.x > soldier.x ? 1 : -1;
-              soldier.state = 'shooting';
-              soundEngine.playGunshot(false);
+              if (soldier.huntAimTargetId !== animal.id) {
+                soldier.huntAimTargetId = animal.id;
+                soldier.huntAimTimer = 0;
+              }
+              soldier.huntAimTimer = (soldier.huntAimTimer || 0) + dt;
+              const aimRequired = soldier.role === 'sniper' ? 0.65 : 0.45;
 
-              // Spawn bullet accurately directed towards animal
-              const startX = soldier.x + soldier.facing * 18;
-              const startY = (soldier.y || gY) - 20;
-              const targetX = animal.x;
-              const targetY = (animal.y || gY) - 14;
-              const dx = targetX - startX;
-              const dy = targetY - startY;
-              const dist = Math.hypot(dx, dy) || 1;
+              if (soldier.huntAimTimer < aimRequired) {
+                // Raise rifle and take aim first!
+                soldier.state = 'aiming';
+                soldier.weaponState = 'ready_aim';
+                break;
+              }
 
-              this.spawnProjectile({
-                id: `hunt_${this.projIdCounter++}`,
-                x: startX,
-                y: startY,
-                vx: (dx / dist) * 820,
-                vy: (dy / dist) * 820,
-                type: 'bullet',
-                damage: soldier.role === 'sniper' ? 45 : 20,
-                radius: 4,
-                source: 'soldier',
-                life: 1.2,
-              });
-              break;
+              if (soldier.attackCooldown <= 0) {
+                soldier.huntAimTimer = 0;
+                soldier.attackCooldown = soldier.role === 'sniper' ? 1.8 : 1.2;
+                soldier.state = 'shooting';
+                soldier.weaponState = 'firing';
+                soundEngine.playGunshot(false);
+
+                // Spawn bullet accurately directed towards animal
+                const startX = soldier.x + soldier.facing * 18;
+                const startY = (soldier.y || gY) - 20;
+                const targetX = animal.x;
+                const targetY = (animal.y || gY) - 14;
+                const dx = targetX - startX;
+                const dy = targetY - startY;
+                const dist = Math.hypot(dx, dy) || 1;
+
+                this.spawnProjectile({
+                  id: `hunt_${this.projIdCounter++}`,
+                  x: startX,
+                  y: startY,
+                  vx: (dx / dist) * 820,
+                  vy: (dy / dist) * 820,
+                  type: 'bullet',
+                  damage: soldier.role === 'sniper' ? 45 : 20,
+                  radius: 4,
+                  source: 'soldier',
+                  life: 1.2,
+                });
+                break;
+              }
             }
           }
         }
@@ -1998,6 +2466,29 @@ export class GameEngine {
 
   public executeSlotAction(slot: BuildSlot) {
     const cmd = this.commander;
+
+    if (this.state.inGameTutorial?.enabled) {
+      if (this.state.inGameTutorial.step === 'buy_rifle' && slot.type === 'armory') {
+        this.state.inGameTutorial.isStepCompleted = true;
+        this.state.inGameTutorial.stepTimer = 0;
+      }
+      if (this.state.inGameTutorial.step === 'recruit_soldier' && slot.type === 'recruit_camp') {
+        this.state.inGameTutorial.isStepCompleted = true;
+        this.state.inGameTutorial.stepTimer = 0;
+      }
+      if (this.state.inGameTutorial.step === 'chop_tree' && slot.type === 'scavenge_wood') {
+        this.state.inGameTutorial.isStepCompleted = true;
+        this.state.inGameTutorial.stepTimer = 0;
+      }
+      if (this.state.inGameTutorial.step === 'build_trench' && slot.type === 'trench') {
+        this.state.inGameTutorial.isStepCompleted = true;
+        this.state.inGameTutorial.stepTimer = 0;
+      }
+      if (this.state.inGameTutorial.step === 'build_wire' && slot.type === 'barbed_wire') {
+        this.state.inGameTutorial.isStepCompleted = true;
+        this.state.inGameTutorial.stepTimer = 0;
+      }
+    }
 
     // 0. Cancel active construction if currently under construction (Refunds 50% of cost)
     if (slot.underConstruction) {
@@ -2153,7 +2644,7 @@ export class GameEngine {
       return;
     }
 
-    // 4.5 Assault Banners (4 Coins -> Equip idle volunteer as Heavy Shock Troop Knight Archetype, max 5 per side)
+    // 4.5 Assault Banners (4 Coins -> Equip idle volunteer or leave armor on stand, max 4 per side)
     if (slot.type === 'assault_banner') {
       const hq = this.slots.find((s) => s.id === 'hq_main');
       if (!hq || hq.level < 3) {
@@ -2163,16 +2654,10 @@ export class GameEngine {
 
       const side = (slot.side as 'left' | 'right') || 'left';
       const currentAssaultCount = this.soldiers.filter((s) => s.isAssaultSquad && s.assaultSide === side && s.health > 0).length;
-      if (currentAssaultCount >= 5) {
-        this.addFloatingText(slot.x, 380, `⚔️ ${side === 'left' ? 'Sol' : 'Sağ'} Taarruz Kıtası Dolu (Azami 5 Nefer)!`, '#f59e0b');
-        return;
-      }
-
-      // Find an idle unassigned recruit or volunteer soldier
-      const candidate = this.soldiers.find((s) => s.role === 'recruit' && !s.isAssaultSquad) ||
-                        this.soldiers.find((s) => !s.assignedSlotId && !s.isRetinue && !s.isAssaultSquad && !s.targetTreeId);
-      if (!candidate) {
-        this.addFloatingText(slot.x, 380, '⚠️ Gönüllü Nefer Yok! Önce Köyden Nefer Çağırın (2🪙)', '#ef4444');
+      const walkingCount = this.soldiers.filter((s) => s.targetEquipSlotId === slot.id && s.health > 0).length;
+      const armorsOnStand = slot.availableAssaultArmors || 0;
+      if (currentAssaultCount + walkingCount + armorsOnStand >= 4) {
+        this.addFloatingText(slot.x, 380, `⚔️ ${side === 'left' ? 'Sol' : 'Sağ'} Taarruz Kıtası ve Zırh Sehpası Dolu (Azami 4)!`, '#f59e0b');
         return;
       }
 
@@ -2183,46 +2668,33 @@ export class GameEngine {
 
         if (slot.coinsDeposited >= 4) {
           slot.coinsDeposited = 0;
-          // Re-validate candidate
-          const recruit = this.soldiers.find((s) => s.role === 'recruit' && !s.isAssaultSquad) ||
-                          this.soldiers.find((s) => !s.assignedSlotId && !s.isRetinue && !s.isAssaultSquad && !s.targetTreeId);
-          if (!recruit) {
-            this.spawnGroundCoin(slot.x, 4, false, 0.3);
-            this.addFloatingText(slot.x, 380, '⚠️ Gönüllü Nefer Kalmadı! 4 Sikke İade Edildi', '#ef4444');
-            return;
+          slot.availableAssaultArmors = (slot.availableAssaultArmors || 0) + 1;
+          soundEngine.playArmorEquip();
+
+          // Check if an unassigned soldier or recruit is available to equip the armor immediately
+          const assignedCandidate = this.soldiers.find((s) => s.health > 0 && !s.targetEquipSlotId && !s.isAssaultSquad && (s.role === 'recruit' || (!s.assignedSlotId && !s.isRetinue && !s.targetTreeId && !s.isArtilleryCrew))) ||
+                                    this.soldiers.find((s) => s.health > 0 && !s.targetEquipSlotId && !s.isAssaultSquad && !s.isRetinue && !s.isArtilleryCrew);
+          if (assignedCandidate) {
+            // Order the soldier to walk directly to the assault banner stand to equip armor!
+            assignedCandidate.targetEquipSlotId = slot.id;
+            if (assignedCandidate.assignedSlotId) {
+              const oldSlot = this.slots.find((s) => s.id === assignedCandidate.assignedSlotId);
+              if (oldSlot) {
+                oldSlot.assignedSoldierIds = oldSlot.assignedSoldierIds.filter((id) => id !== assignedCandidate.id);
+              }
+              assignedCandidate.assignedSlotId = null;
+            }
+            assignedCandidate.targetTreeId = null;
+            assignedCandidate.state = 'walking';
+            assignedCandidate.facing = (assignedCandidate.x < slot.x ? 1 : -1) as 1 | -1;
+
+            soundEngine.playAssaultShout();
+            this.addFloatingText(assignedCandidate.x, 370, '🛡️ Taarruz Zırhını Kuşanmaya Gidiyor...', '#fde047');
+            this.addFloatingText(slot.x, 350, `🇹🇷 ${side === 'left' ? 'Sol' : 'Sağ'} Taarruz Zırhı Hazırlandı! (${currentAssaultCount + walkingCount + armorsOnStand + 1}/4)`, '#4ade80');
+          } else {
+            // Armor rests on the stand waiting for recruits! Cephanelikteki gibi!
+            this.addFloatingText(slot.x, 350, `🛡️ Taarruz Zırhı Sehpaya Bırakıldı! (${slot.availableAssaultArmors}/4) Boş nefer gelince kuşanacak`, '#fbbf24');
           }
-
-          // Equip Heavy Ottoman Assault Shock Troop Armor (Kingdom Knight Equivalent)
-          recruit.role = 'infantry';
-          recruit.isAssaultSquad = true;
-          recruit.assaultSide = side;
-          recruit.maxHealth = 400; // Heavy armored knight HP
-          recruit.health = 400;
-          recruit.bayonetDamage = 60;
-          recruit.assignedSlotId = null;
-          recruit.targetTreeId = null;
-          recruit.x = slot.x;
-          recruit.ammoInClip = 5;
-          recruit.maxAmmoInClip = 5;
-
-          const targetCamp = this.landingCamps.find((c) => c.side === side && !c.isDestroyed) || this.landingCamps.find((c) => !c.isDestroyed);
-          recruit.targetCampId = targetCamp ? targetCamp.id : null;
-
-          // Check if there is an active FieldArtillery on this flank waiting for crew (needs 2 soldiers)
-          const targetArt = this.fieldArtilleries.find((fa) => fa.side === side && fa.health > 0 && fa.crewSoldierIds.length < 2);
-          if (targetArt) {
-            targetArt.crewSoldierIds.push(recruit.id);
-            recruit.isArtilleryCrew = true;
-            recruit.artilleryId = targetArt.id;
-            this.addFloatingText(slot.x, 320, `🪖 Akıncı Sahra Topu Mürettebatına Katıldı! (${targetArt.crewSoldierIds.length}/2)`, '#facc15');
-          }
-
-          soundEngine.playAssaultShout();
-          soundEngine.playReload();
-          this.spawnDebris(slot.x, 430, '#94a3b8', 8);
-          this.spawnDebris(slot.x, 430, '#f59e0b', 6);
-          this.addFloatingText(slot.x, 360, `🇹🇷 ${side === 'left' ? 'Sol' : 'Sağ'} Hücum Akıncısı Donatıldı! (${currentAssaultCount + 1}/5)`, '#4ade80');
-          this.addFloatingText(slot.x, 340, '🪖 "Emrinizdeyiz Kumandanım! Zafer Bizimdir!"', '#fde047');
           this.recheckSoldierAssignments();
         }
       } else if ((slot.coinsDeposited || 0) < 4) {
@@ -2462,11 +2934,15 @@ export class GameEngine {
         s.moraleBuffTimer = 9999;
       });
     } else if (relicId.includes('statue_defense')) {
-      // Mecidiye Tabyası İstihkâm Yadigârı: Tüm mevzi ve binaların canını %50 artır ve hasarlı mevzileri onar
+      // Mecidiye Tabyası İstihkâm Yadigârı: Tüm mevzi ve binaların azami canını %50 artır ve eksiksiz doldur/onar
       this.slots.forEach((s) => {
         if (s.type !== 'shrine_relic' && s.type !== 'recruit_camp' && s.type !== 'scavenge_wood' && s.type !== 'scavenge_iron' && s.type !== 'treasure_chest') {
-          s.maxHealth = Math.round(s.maxHealth * 1.5);
-          s.health = Math.min(s.maxHealth, s.health + 120);
+          if (!(s as any).relicBuffedDefense) {
+            s.maxHealth = Math.round(s.maxHealth * 1.5);
+            (s as any).relicBuffedDefense = true;
+          }
+          // Binaların canını yeni azami canına eşitle (hasar barı veya tamir yuvası açılmaz)
+          s.health = s.maxHealth;
         }
       });
     }
@@ -2651,6 +3127,34 @@ export class GameEngine {
       }
     }
 
+    // 1.5 Check if any assault banner has available assault armors waiting on the stand!
+    const bannersWithArmor = this.slots.filter((s) => s.type === 'assault_banner' && (s.availableAssaultArmors || 0) > 0);
+    for (const banner of bannersWithArmor) {
+      const neededArmorCount = banner.availableAssaultArmors || 0;
+      const walkingCount = this.soldiers.filter((s) => s.targetEquipSlotId === banner.id && s.health > 0).length;
+      if (walkingCount < neededArmorCount) {
+        const candidate = this.soldiers.find((s) =>
+          s.health > 0 &&
+          !s.targetEquipSlotId &&
+          !s.isAssaultSquad &&
+          !s.isRetinue &&
+          !s.isArtilleryCrew &&
+          (s.role === 'recruit' || (!s.assignedSlotId && !s.targetTreeId))
+        );
+        if (candidate) {
+          candidate.targetEquipSlotId = banner.id;
+          if (candidate.assignedSlotId) {
+            const oldSlot = this.slots.find((s) => s.id === candidate.assignedSlotId);
+            if (oldSlot) oldSlot.assignedSoldierIds = oldSlot.assignedSoldierIds.filter((id) => id !== candidate.id);
+            candidate.assignedSlotId = null;
+          }
+          candidate.targetTreeId = null;
+          candidate.state = 'walking';
+          candidate.facing = (candidate.x < banner.x ? 1 : -1) as 1 | -1;
+        }
+      }
+    }
+
     // 2. Find any free armed soldiers and garrison empty defensive slots
     const availableSoldiers = this.soldiers.filter((s) => !s.assignedSlotId && s.role !== 'recruit' && !s.isRetinue && !s.isAssaultSquad && !s.targetTreeId);
     for (const soldier of availableSoldiers) {
@@ -2658,9 +3162,107 @@ export class GameEngine {
     }
   }
 
+  // --- Assault Squad Charge Order (1 Coin paid to Heavy Vanguard at the border to order charge) ---
+  public orderAssaultSquadToCharge(): boolean {
+    const cmd = this.commander;
+
+    // 1. Check if commander is near a defending heavy vanguard at the border
+    const defendingVanguard = this.soldiers.find((s) => 
+      s.isAssaultHeavyArmor && 
+      s.health > 0 && 
+      s.assaultState === 'defending' && 
+      Math.abs(s.x - cmd.x) < 55
+    );
+
+    if (defendingVanguard) {
+      if (cmd.mecidiye < 1) {
+        this.addFloatingText(defendingVanguard.x, 370, '1 Sikke Gerekli! (Taarruz Emri)', '#ef4444');
+        return true; // Intercept interaction
+      }
+
+      cmd.mecidiye -= 1;
+      soundEngine.playCoinPay();
+      soundEngine.playBugleCharge();
+      soundEngine.playAssaultShout();
+
+      const flank = defendingVanguard.assaultSide;
+      const squad = this.soldiers.filter((s) => s.isAssaultSquad && s.assaultSide === flank && s.health > 0);
+      for (const s of squad) {
+        s.assaultState = 'charging';
+        s.isWalking = true;
+        s.state = 'walking';
+        s.weaponState = 'shouldered';
+      }
+
+      this.spawnDebris(defendingVanguard.x, 420, '#fbbf24', 10);
+      this.addFloatingText(defendingVanguard.x, 330, '🇹🇷 "ALLAH ALLAH! DÜŞMAN GEMİSİNE TAARRUZ!"', '#22c55e');
+      return true;
+    }
+
+    // 2. Check if commander is near a vanguard without target camp (e.g. initial camp destroyed, redirect to other camp)
+    const otherCamp = this.landingCamps.find((c) => !c.isDestroyed);
+    if (otherCamp) {
+      const idleVanguard = this.soldiers.find((s) => 
+        s.isAssaultHeavyArmor && 
+        s.health > 0 && 
+        !s.targetCampId && 
+        Math.abs(s.x - cmd.x) < 55
+      );
+
+      if (idleVanguard) {
+        if (cmd.mecidiye < 1) {
+          this.addFloatingText(idleVanguard.x, 370, '1 Sikke Gerekli! (Diğer Gemiye Hücum)', '#ef4444');
+          return true;
+        }
+
+        cmd.mecidiye -= 1;
+        soundEngine.playCoinPay();
+        soundEngine.playBugleCharge();
+        soundEngine.playAssaultShout();
+
+        const squad = this.soldiers.filter((s) => s.isAssaultSquad && s.health > 0 && !s.targetCampId);
+        for (const s of squad) {
+          s.targetCampId = otherCamp.id;
+          s.assaultSide = otherCamp.side;
+          s.assaultState = 'charging';
+          s.isReturningFromAssault = false;
+          s.isWalking = true;
+          s.state = 'walking';
+          s.weaponState = 'shouldered';
+          s.facing = (otherCamp.x > s.x ? 1 : -1) as 1 | -1;
+        }
+
+        this.spawnDebris(idleVanguard.x, 420, '#fbbf24', 8);
+        this.addFloatingText(idleVanguard.x, 340, '🇹🇷 "Emredersiniz Kumandanım! Diğer Gemiye Hücum!"', '#22c55e');
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  public sendAssaultSquadToOtherCamp(): boolean {
+    return this.orderAssaultSquadToCharge();
+  }
+
   // --- Commander Special Whistle (Q) & Abilities ---
 
   public useCommanderWhistle() {
+    if (this.state.inGameTutorial?.enabled && this.state.inGameTutorial.step === 'use_whistle') {
+      this.commander.whistleCooldown = 12;
+      this.commander.buffTimer = 8;
+      this.commander.activeBuff = 'Hücum Emri & Yüksek Moral';
+      soundEngine.playWhistle();
+      soundEngine.playBugleCharge();
+      this.addFloatingText(this.commander.x, 340, '📯 Talim Hücumu! Mehmetçik Şahlandı!', '#f59e0b');
+      this.state.inGameTutorial.isStepCompleted = true;
+      this.state.inGameTutorial.stepTimer = 0;
+      for (const s of this.soldiers) {
+        s.moraleBuffTimer = 8;
+      }
+      return;
+    }
+
     if (this.commander.whistleCooldown > 0) {
       this.addFloatingText(this.commander.x, 380, `Düdük Doluyor... (${Math.ceil(this.commander.whistleCooldown)}s)`, '#94a3b8');
       return;
@@ -2734,9 +3336,9 @@ export class GameEngine {
     // Construction Timers & Progression
     for (const slot of this.slots) {
       // Apply Defense Relic once per slot
-      if (hasDefenseRelic && slot.type !== 'shrine_relic' && slot.type !== 'treasure_chest' && !(slot as any).relicBuffedDefense) {
+      if (hasDefenseRelic && slot.type !== 'shrine_relic' && slot.type !== 'recruit_camp' && slot.type !== 'scavenge_wood' && slot.type !== 'scavenge_iron' && slot.type !== 'treasure_chest' && !(slot as any).relicBuffedDefense) {
         slot.maxHealth = Math.floor(slot.maxHealth * 1.5);
-        slot.health = Math.floor(slot.health * 1.5);
+        slot.health = slot.maxHealth;
         (slot as any).relicBuffedDefense = true;
       }
 
@@ -2882,6 +3484,12 @@ export class GameEngine {
             slot.costMecidiye = Math.floor(slot.costMecidiye * 1.6) + 1;
           }
 
+          if (hasDefenseRelic) {
+            slot.maxHealth = Math.floor(slot.maxHealth * 1.5);
+            slot.health = slot.maxHealth;
+            (slot as any).relicBuffedDefense = true;
+          }
+
           if (slot.id === 'hq_main' && slot.level === 3) {
             slot.maxSoldiers = 2;
           }
@@ -2995,22 +3603,103 @@ export class GameEngine {
         }
       }
 
-      // 0. RETURNING FROM ASSAULT (Gemi imha edildikten sonra kaybolmadan karargaha yürüyerek dönen akıncılar)
+      // 0. RETURNING FROM ASSAULT (Gemi imha edildikten sonra zırhlarını çıkarmadan karargaha yürüyerek dönen akıncılar)
       if (soldier.isReturningFromAssault) {
         soldier.assignedSlotId = null;
         soldier.targetTreeId = null;
         soldier.state = 'walking';
-        soldier.facing = soldier.x > hqX ? -1 : 1;
+        soldier.isWalking = true;
+        soldier.weaponState = 'shouldered';
+        soldier.facing = (soldier.x > hqX ? -1 : 1) as 1 | -1;
         soldier.x += soldier.facing * marchSpeed * dt;
 
-        // Once back inside the frontier defenses, rejoin ordinary garrison safely
+        // Once back inside headquarters perimeter, take up defensive guard positions without losing armor
         if ((soldier.x >= leftmostDefX - 40 && soldier.x <= rightmostDefX + 40) || Math.abs(soldier.x - hqX) < 250) {
           soldier.isReturningFromAssault = false;
+          soldier.isWalking = false;
           soldier.state = 'idle';
-          this.autoAssignSoldier(soldier);
-          this.recheckSoldierAssignments();
+          soldier.weaponState = 'shouldered';
+          // User: "gemiyi yıktıktan sonra zırhları ve taaruz askerleri normal askere dönüşüyor dönüşmesin aynı kalsın"
+          // Keep assault armor and status intact!
         }
         continue;
+      }
+
+      // 0. SOLDIER WALKING TO EQUIP ASSAULT ARMOR AT BANNER STAND
+      if (soldier.targetEquipSlotId) {
+        const equipSlot = this.slots.find((s) => s.id === soldier.targetEquipSlotId);
+        if (!equipSlot || equipSlot.health <= 0) {
+          soldier.targetEquipSlotId = null;
+          this.recheckSoldierAssignments();
+          continue;
+        }
+
+        const distToSlot = Math.abs(soldier.x - equipSlot.x);
+        if (distToSlot > 12) {
+          soldier.state = 'walking';
+          soldier.weaponState = 'shouldered';
+          soldier.facing = (equipSlot.x > soldier.x ? 1 : -1) as 1 | -1;
+          soldier.x += soldier.facing * marchSpeed * dt;
+          continue;
+        } else {
+          // Arrived at the assault armor rack to equip!
+          soldier.x = equipSlot.x;
+          soldier.targetEquipSlotId = null;
+          if ((equipSlot.availableAssaultArmors || 0) > 0) {
+            equipSlot.availableAssaultArmors = Math.max(0, (equipSlot.availableAssaultArmors || 0) - 1);
+          }
+
+          const side = (equipSlot.side as 'left' | 'right') || 'left';
+          // Check existing assault soldiers on this flank
+          const flankAssaults = this.soldiers.filter((s) => s.isAssaultSquad && s.assaultSide === side && s.health > 0 && s.id !== soldier.id);
+          const isFirstVanguard = flankAssaults.length === 0 || !flankAssaults.some((s) => s.isAssaultHeavyArmor);
+
+          soldier.role = 'infantry';
+          soldier.isAssaultSquad = true;
+          soldier.assaultSide = side;
+          soldier.assignedSlotId = null;
+          soldier.targetTreeId = null;
+          soldier.ammoInClip = 5;
+          soldier.maxAmmoInClip = 5;
+          soldier.state = 'idle';
+
+          if (isFirstVanguard) {
+            // First assault soldier on this flank: FULL WWI HEAVY TRENCH ARMOR & STEEL SHIELD
+            soldier.isAssaultHeavyArmor = true;
+            soldier.assaultOrder = 0;
+            soldier.maxHealth = 850;
+            soldier.health = 850;
+            soldier.bayonetDamage = 90;
+            soundEngine.playArmorEquip();
+            this.spawnDebris(soldier.x, gY - 20, '#94a3b8', 12);
+            this.spawnDebris(soldier.x, gY - 20, '#1e293b', 8);
+            this.addFloatingText(soldier.x, 340, '🛡️ Tam Zırhlı Taarruz Öncüsü Kuşandı! (Siper Zırhı & Çelik Kalkan)', '#f59e0b');
+          } else {
+            // 2nd and subsequent soldiers: Normal assault shock troop appearance
+            soldier.isAssaultHeavyArmor = false;
+            soldier.assaultOrder = flankAssaults.length;
+            soldier.maxHealth = 420;
+            soldier.health = 420;
+            soldier.bayonetDamage = 60;
+            soundEngine.playArmorEquip();
+            this.spawnDebris(soldier.x, gY - 20, '#556b2f', 8);
+            this.addFloatingText(soldier.x, 340, '⚔️ Taarruz Askeri Kuşandı!', '#22c55e');
+          }
+
+          soldier.assaultState = 'defending';
+          const targetCamp = this.landingCamps.find((c) => c.side === side && !c.isDestroyed) || this.landingCamps.find((c) => !c.isDestroyed);
+          soldier.targetCampId = targetCamp ? targetCamp.id : null;
+
+          // Check if there is an active FieldArtillery on this flank waiting for crew
+          const targetArt = this.fieldArtilleries.find((fa) => fa.side === side && fa.health > 0 && fa.crewSoldierIds.length < 2);
+          if (targetArt) {
+            targetArt.crewSoldierIds.push(soldier.id);
+            soldier.isArtilleryCrew = true;
+            soldier.artilleryId = targetArt.id;
+            this.addFloatingText(soldier.x, 320, `🪖 Akıncı Sahra Topu Mürettebatına Katıldı! (${targetArt.crewSoldierIds.length}/2)`, '#facc15');
+          }
+          continue;
+        }
       }
 
       // 1. ASSAULT SQUAD / KUŞATMA AKINCISI (Takes absolute priority over garrisoning)
@@ -3037,99 +3726,318 @@ export class GameEngine {
 
         if (targetCamp) {
           soldier.targetCampId = targetCamp.id;
+          soldier.facing = (targetCamp.x > soldier.x ? 1 : -1) as 1 | -1;
           const distToCamp = Math.abs(soldier.x - targetCamp.x);
-          soldier.facing = targetCamp.x > soldier.x ? 1 : -1;
 
-          // Check if there is an active Field Artillery on this flank with full crew!
-          // User: "ama top başında asker varsa diğer taaruz askerleri topu beklesin tabii top biraz yavaş olacağından taaruz askerleri topun biraz önünde top da arkada saldırmaya gitsin"
-          const sideArtillery = this.fieldArtilleries.find((fa) => fa.side === soldier.assaultSide && fa.health > 0 && fa.crewSoldierIds.length >= 2);
-          const isTooFarAheadOfGun = sideArtillery && ((soldier.x - sideArtillery.x) * sideArtillery.facing > 85) && distToCamp > 320;
+          // Get squad members on this flank and sort so Heavy Vanguard is always at the front (index 0)
+          const squad = this.soldiers.filter((s) => s.isAssaultSquad && s.assaultSide === soldier.assaultSide && s.health > 0);
+          squad.sort((a, b) => {
+            if (a.isAssaultHeavyArmor && !b.isAssaultHeavyArmor) return -1;
+            if (!a.isAssaultHeavyArmor && b.isAssaultHeavyArmor) return 1;
+            return a.id.localeCompare(b.id);
+          });
+          const rankIndex = Math.max(0, squad.indexOf(soldier));
+          const vanguard = squad[0] || soldier;
+          soldier.assaultOrder = rankIndex;
 
-          // Attack nearby marching enemies encountered on the road to the camp!
-          const nearbyEnemy = this.enemies.find((e) => e.health > 0 && Math.abs(e.x - soldier.x) < 220);
-
-          if (nearbyEnemy && soldier.attackCooldown <= 0) {
-            soldier.state = 'shooting';
-            soldier.facing = nearbyEnemy.x > soldier.x ? 1 : -1;
-            soldier.attackCooldown = 0.85;
-            soldier.muzzleFlashTimer = 0.08;
-            soundEngine.playGunshot(false);
-            this.spawnProjectile({
-              id: `bullet_${this.projIdCounter++}`,
-              x: soldier.x + soldier.facing * 18,
-              y: gY - 20,
-              vx: soldier.facing * 880,
-              vy: 0,
-              type: 'bullet',
-              damage: 55,
-              radius: 4,
-              source: 'soldier',
-              life: 1.5,
-            });
-          } else if (isTooFarAheadOfGun) {
-            // Wait for slow-moving field artillery to catch up while maintaining vanguard position
-            soldier.state = 'idle';
-            soldier.facing = targetCamp.x > soldier.x ? 1 : -1;
-          } else if (distToCamp > 260) {
-            // March toward the enemy landing camp
-            soldier.state = 'walking';
-            soldier.x += soldier.facing * marchSpeed * dt;
-          } else {
-            // Reached assault range: bombard camp relentlessly
-            soldier.state = 'shooting';
+          if (!soldier.assaultState) {
+            soldier.assaultState = 'defending';
           }
 
-          if (soldier.attackCooldown <= 0 && distToCamp <= 340) {
-            soldier.state = 'shooting';
-            soldier.attackCooldown = 1.1;
-            soldier.muzzleFlashTimer = 0.08;
-            soundEngine.playGunshot(false);
-
-            // User: "daha az el bombası atsınlar ve gemiyi daha zor patlatsınlar" -> 18% grenade chance, 82% rifle
-            if (Math.random() < 0.18) {
-              // Lob stick grenade directly aimed with calculated ballistic arc to hit the ship deck/hull
-              const dx = (targetCamp.x + (Math.random() - 0.5) * 35) - soldier.x;
-              const flightTime = 1.15;
-              const vx = dx / flightTime;
-              const vy = -170; // High arc
-              this.spawnProjectile({
-                id: `grenade_${this.projIdCounter++}`,
-                x: soldier.x + soldier.facing * 16,
-                y: gY - 22,
-                vx,
-                vy,
-                type: 'grenade',
-                damage: 85,
-                radius: 80,
-                source: 'assault_squad',
-                life: flightTime + 0.1,
-                targetX: targetCamp.x,
-                targetY: gY - 20,
-              });
+          // Case A: Defending within base borders
+          if (soldier.assaultState === 'defending') {
+            const flankSlots = this.slots.filter(
+              (s) => s.side === soldier.assaultSide && s.level > 0 && s.health > 0 && (s.type === 'trench' || s.type === 'barbed_wire' || s.type === 'machine_gun')
+            );
+            let frontierX: number;
+            if (flankSlots.length > 0) {
+              frontierX = soldier.assaultSide === 'left'
+                ? Math.min(...flankSlots.map((s) => s.x))
+                : Math.max(...flankSlots.map((s) => s.x));
             } else {
-              // Mauser rifle shot against ship
-              this.spawnProjectile({
-                id: `bullet_${this.projIdCounter++}`,
-                x: soldier.x + soldier.facing * 18,
-                y: gY - 20,
-                vx: soldier.facing * 880,
-                vy: 0,
-                type: 'bullet',
-                damage: 55,
-                radius: 4,
-                source: 'assault_squad',
-                life: 1.5,
-              });
+              frontierX = hqX + (soldier.assaultSide === 'left' ? -260 : 260);
+            }
+
+            const flankDir = soldier.assaultSide === 'left' ? -1 : 1;
+            const targetX = frontierX - flankDir * (rankIndex * 32);
+            const distToTarget = Math.abs(soldier.x - targetX);
+
+            // Check if any enemy is attacking or near the frontier
+            const threatEnemy = this.enemies.find((e) => {
+              if (e.health <= 0 || e.state === 'dying') return false;
+              return Math.abs(e.x - soldier.x) < 280 && (e.x - soldier.x) * flankDir > -40;
+            });
+
+            if (threatEnemy) {
+              soldier.isWalking = false;
+              soldier.facing = (threatEnemy.x > soldier.x ? 1 : -1) as 1 | -1;
+              const enemyDist = Math.abs(threatEnemy.x - soldier.x);
+              if (enemyDist < 44) {
+                soldier.state = 'bayonet';
+                soldier.weaponState = 'firing';
+                if (soldier.attackCooldown <= 0) {
+                  soldier.attackCooldown = 0.65;
+                  const meleeDmg = soldier.isAssaultHeavyArmor ? 90 : 60;
+                  threatEnemy.health -= meleeDmg;
+                  this.spawnBlood(threatEnemy.x, gY - 18, 4);
+                  soundEngine.playBayonetClash();
+                  if (threatEnemy.health <= 0) this.onEnemyDefeated(threatEnemy);
+                }
+              } else {
+                soldier.state = 'shooting';
+                if (soldier.attackCooldown <= 0) {
+                  soldier.weaponState = 'firing';
+                  soldier.attackCooldown = soldier.isAssaultHeavyArmor ? 1.0 : 0.85;
+                  soldier.muzzleFlashTimer = 0.12;
+                  soundEngine.playGunshot(false);
+                  this.spawnProjectile({
+                    id: `bullet_${this.projIdCounter++}`,
+                    x: soldier.x + soldier.facing * 18,
+                    y: gY - 20,
+                    vx: soldier.facing * 880,
+                    vy: 0,
+                    type: 'bullet',
+                    damage: soldier.isAssaultHeavyArmor ? 45 : 55,
+                    radius: 4,
+                    source: 'soldier',
+                    life: 1.5,
+                  });
+                } else {
+                  soldier.weaponState = soldier.attackCooldown > 0.4 ? 'reloading' : 'ready_aim';
+                }
+              }
+            } else {
+              // Move to assigned frontier station position in clean ordered file
+              if (distToTarget > 6) {
+                soldier.isWalking = true;
+                soldier.state = 'walking';
+                soldier.weaponState = 'shouldered';
+                soldier.facing = (targetX > soldier.x ? 1 : -1) as 1 | -1;
+                soldier.x += soldier.facing * marchSpeed * dt;
+              } else {
+                soldier.isWalking = false;
+                soldier.state = 'idle';
+                soldier.weaponState = 'ready_aim';
+                soldier.facing = flankDir as 1 | -1;
+              }
+            }
+            continue;
+          }
+
+          // Case B: Charging towards enemy landing camp
+          // Check if there are ANY enemies blocking the road or in close proximity!
+          const blockingEnemy = this.enemies.find((e) => {
+            if (e.health <= 0 || e.state === 'dying') return false;
+            const dist = Math.abs(e.x - soldier.x);
+            const inFront = (e.x - soldier.x) * soldier.facing > -40;
+            return dist < 260 && inFront;
+          });
+
+          if (blockingEnemy) {
+            // HALT! Stand ground and fight enemy until eliminated. NEVER walk through them!
+            soldier.isWalking = false;
+            const enemyDist = Math.abs(blockingEnemy.x - soldier.x);
+            soldier.facing = (blockingEnemy.x > soldier.x ? 1 : -1) as 1 | -1;
+
+            if (enemyDist < 44) {
+              // Melee range: Bayonet lunge & heavy melee strike!
+              soldier.state = 'bayonet';
+              soldier.weaponState = 'firing';
+              if (soldier.attackCooldown <= 0) {
+                soldier.attackCooldown = 0.65;
+                const meleeDmg = soldier.isAssaultHeavyArmor ? 90 : 60;
+                blockingEnemy.health -= meleeDmg;
+                this.spawnBlood(blockingEnemy.x, gY - 18, 4);
+                soundEngine.playBayonetClash();
+                if (soldier.isAssaultHeavyArmor) {
+                  this.spawnDebris(blockingEnemy.x, gY - 18, '#94a3b8', 6);
+                }
+                if (blockingEnemy.health <= 0) {
+                  this.onEnemyDefeated(blockingEnemy);
+                }
+              }
+            } else {
+              // Range combat: disciplined shoulder-level rifle firing stance
+              soldier.state = 'shooting';
+              if (soldier.attackCooldown <= 0) {
+                soldier.weaponState = 'firing';
+                soldier.attackCooldown = soldier.isAssaultHeavyArmor ? 1.0 : 0.85;
+                soldier.muzzleFlashTimer = 0.12;
+                soundEngine.playGunshot(false);
+                this.spawnProjectile({
+                  id: `bullet_${this.projIdCounter++}`,
+                  x: soldier.x + soldier.facing * 18,
+                  y: gY - 20,
+                  vx: soldier.facing * 880,
+                  vy: 0,
+                  type: 'bullet',
+                  damage: soldier.isAssaultHeavyArmor ? 45 : 55,
+                  radius: 4,
+                  source: 'soldier',
+                  life: 1.5,
+                });
+              } else {
+                soldier.weaponState = soldier.attackCooldown > 0.4 ? 'reloading' : 'ready_aim';
+              }
+            }
+          } else {
+            // Road is clear of enemies! March towards camp or bombard ship
+            const sideArtillery = this.fieldArtilleries.find((fa) => fa.side === soldier.assaultSide && fa.health > 0 && fa.crewSoldierIds.length >= 2);
+            const isTooFarAheadOfGun = sideArtillery && ((soldier.x - sideArtillery.x) * sideArtillery.facing > 110) && distToCamp > 320;
+
+            // Staggered non-overlapping stopping distances when bombarding ship!
+            const stopDist = 195 + rankIndex * 35;
+
+            if (isTooFarAheadOfGun) {
+              soldier.isWalking = false;
+              soldier.state = 'idle';
+              soldier.weaponState = 'ready_aim';
+              soldier.facing = (targetCamp.x > soldier.x ? 1 : -1) as 1 | -1;
+            } else if (distToCamp > stopDist + 6) {
+              // March toward the enemy landing camp in strict queued single-file column (arda arda sıralı)
+              if (rankIndex === 0) {
+                soldier.isWalking = true;
+                soldier.state = 'walking';
+                soldier.weaponState = 'shouldered';
+                soldier.x += soldier.facing * marchSpeed * dt;
+              } else {
+                const targetX = vanguard.x - vanguard.facing * (rankIndex * 32);
+                const distToTarget = Math.abs(soldier.x - targetX);
+                if (distToTarget > 4) {
+                  soldier.isWalking = true;
+                  soldier.state = 'walking';
+                  soldier.weaponState = 'shouldered';
+                  soldier.facing = vanguard.facing;
+                  const step = Math.min(distToTarget, marchSpeed * dt * (distToTarget > 45 ? 1.25 : 1.0));
+                  soldier.x += Math.sign(targetX - soldier.x) * step;
+                } else {
+                  soldier.isWalking = vanguard.isWalking;
+                  soldier.state = vanguard.state;
+                  soldier.facing = vanguard.facing;
+                  soldier.weaponState = vanguard.weaponState;
+                }
+              }
+            } else {
+              // In position at designated firing line! Aim rifle firmly at shoulder level and bombard ship
+              soldier.isWalking = false;
+              soldier.state = 'shooting';
+              soldier.facing = (targetCamp.x > soldier.x ? 1 : -1) as 1 | -1;
+
+              if (soldier.attackCooldown <= 0) {
+                soldier.weaponState = 'firing';
+                soldier.attackCooldown = 1.0 + (rankIndex % 3) * 0.3; // natural staggered firing rhythm
+                soldier.muzzleFlashTimer = 0.12;
+                soundEngine.playGunshot(false);
+
+                // 18% stick grenade chance, 82% rifle shot
+                if (Math.random() < 0.18) {
+                  const dx = (targetCamp.x + (Math.random() - 0.5) * 35) - soldier.x;
+                  const flightTime = 1.15;
+                  const vx = dx / flightTime;
+                  const vy = -170;
+                  this.spawnProjectile({
+                    id: `grenade_${this.projIdCounter++}`,
+                    x: soldier.x + soldier.facing * 16,
+                    y: gY - 22,
+                    vx,
+                    vy,
+                    type: 'grenade',
+                    damage: 85,
+                    radius: 80,
+                    source: 'assault_squad',
+                    life: flightTime + 0.1,
+                    targetX: targetCamp.x,
+                    targetY: gY - 20,
+                  });
+                } else {
+                  this.spawnProjectile({
+                    id: `bullet_${this.projIdCounter++}`,
+                    x: soldier.x + soldier.facing * 18,
+                    y: gY - 20,
+                    vx: soldier.facing * 880,
+                    vy: 0,
+                    type: 'bullet',
+                    damage: 55,
+                    radius: 4,
+                    source: 'assault_squad',
+                    life: 1.5,
+                  });
+                }
+              } else {
+                // While waiting for next shot, maintain steady aim at ship or cycle bolt
+                soldier.weaponState = soldier.attackCooldown > 0.5 ? 'reloading' : 'ready_aim';
+              }
             }
           }
         } else {
-          // Target camp destroyed! March victoriously back to headquarters / defense line without disappearing
-          soldier.isAssaultSquad = false;
+          // Target camp destroyed! User: "gemiyi yıktıktan sonra zırhları ve taaruz askerleri normal askere dönüşüyor dönüşmesin aynı kalsın"
+          // Keep assault armor! March victoriously back to headquarters or defend inside headquarters
           soldier.targetCampId = null;
-          soldier.isReturningFromAssault = true;
-          soldier.state = 'walking';
-          soldier.facing = soldier.x > hqX ? -1 : 1;
+          if (Math.abs(soldier.x - hqX) > 220) {
+            soldier.isReturningFromAssault = true;
+            soldier.isWalking = true;
+            soldier.state = 'walking';
+            soldier.weaponState = 'shouldered';
+            soldier.facing = (soldier.x > hqX ? -1 : 1) as 1 | -1;
+            soldier.x += soldier.facing * marchSpeed * dt;
+          } else {
+            // Stationed inside headquarters!
+            soldier.isReturningFromAssault = false;
+            soldier.isWalking = false;
+
+            // Defend headquarters actively against night wave threats
+            const nearbyDefEnemy = this.enemies.find((e) => e.health > 0 && e.state !== 'dying' && Math.abs(e.x - soldier.x) < 260);
+            if (nearbyDefEnemy) {
+              soldier.facing = (nearbyDefEnemy.x > soldier.x ? 1 : -1) as 1 | -1;
+              const enemyDist = Math.abs(nearbyDefEnemy.x - soldier.x);
+              if (enemyDist < 44) {
+                soldier.state = 'bayonet';
+                soldier.weaponState = 'firing';
+                if (soldier.attackCooldown <= 0) {
+                  soldier.attackCooldown = 0.65;
+                  const meleeDmg = soldier.isAssaultHeavyArmor ? 90 : 60;
+                  nearbyDefEnemy.health -= meleeDmg;
+                  this.spawnBlood(nearbyDefEnemy.x, gY - 18, 4);
+                  soundEngine.playBayonetClash();
+                  if (soldier.isAssaultHeavyArmor) {
+                    this.spawnDebris(nearbyDefEnemy.x, gY - 18, '#94a3b8', 6);
+                  }
+                  if (nearbyDefEnemy.health <= 0) {
+                    this.onEnemyDefeated(nearbyDefEnemy);
+                  }
+                }
+              } else {
+                soldier.state = 'shooting';
+                if (soldier.attackCooldown <= 0) {
+                  soldier.weaponState = 'firing';
+                  soldier.attackCooldown = soldier.isAssaultHeavyArmor ? 1.0 : 0.85;
+                  soldier.muzzleFlashTimer = 0.12;
+                  soundEngine.playGunshot(false);
+                  this.spawnProjectile({
+                    id: `bullet_${this.projIdCounter++}`,
+                    x: soldier.x + soldier.facing * 18,
+                    y: gY - 20,
+                    vx: soldier.facing * 880,
+                    vy: 0,
+                    type: 'bullet',
+                    damage: soldier.isAssaultHeavyArmor ? 45 : 55,
+                    radius: 4,
+                    source: 'soldier',
+                    life: 1.5,
+                  });
+                } else {
+                  soldier.weaponState = soldier.attackCooldown > 0.4 ? 'reloading' : 'ready_aim';
+                }
+              }
+            } else {
+              // Idle defensive stance guarding headquarters
+              soldier.state = 'idle';
+              soldier.weaponState = 'shouldered';
+              soldier.facing = (soldier.assaultSide === 'left' ? -1 : 1) as 1 | -1;
+            }
+          }
         }
+        continue;
       } else if (soldier.targetTreeId) {
         // 2. DESIGNATED WOODCUTTER (AĞAÇ KESME GÖREVİNDEKİ MEHMETÇİK)
         const myTree = this.slots.find((s) => s.id === soldier.targetTreeId && s.type === 'scavenge_wood' && s.isMarkedForChop && !s.isScavenged);
@@ -3485,8 +4393,10 @@ export class GameEngine {
             if ((isNightOrThreat || distToHq < 160) && isInsideBase) {
               const count = soldier.coinsHeld;
               soldier.coinsHeld = 0;
-              this.spawnGroundCoin(soldier.x, count, false, 0.2);
-              soundEngine.playCoinPay();
+              this.spawnGroundCoin(soldier.x, count, false, 0.4);
+              if (Math.abs(soldier.x - cmd.x) < 600) {
+                soundEngine.playCoinPay();
+              }
               this.addFloatingText(soldier.x, (soldier.y || gY) - 38, `🪙 ${count} Av Geliri Karargâha Bırakıldı!`, '#4ade80');
             }
           }
@@ -3532,17 +4442,25 @@ export class GameEngine {
               } else {
                 const count = soldier.coinsHeld!;
                 soldier.coinsHeld = 0;
-                this.spawnGroundCoin(soldier.x, count, false, 0.2);
-                soundEngine.playCoinPay();
+                this.spawnGroundCoin(soldier.x, count, false, 0.4);
+                if (Math.abs(soldier.x - cmd.x) < 600) {
+                  soundEngine.playCoinPay();
+                }
                 this.addFloatingText(soldier.x, (soldier.y || gY) - 38, `🪙 ${count} Av Geliri Karargâha Bırakıldı!`, '#4ade80');
               }
               continue;
             }
 
             // 1. Pick up ground coins in forest proximity (from freshly killed animals) before shooting new ones
-            // (Exclude coins near Commander as Commander picks them up with magnetic attraction)
+            // Exclude coins near Commander and coins inside base perimeter (base coins are for Commander)
             const nearbyGroundCoin = this.groundCoins.find(
-              (c) => c.life > 0 && Math.abs(c.x - soldier.x) < 260 && c.x >= safeMinX && c.x <= safeMaxX && Math.abs(c.x - cmd.x) >= 90
+              (c) =>
+                c.life > 0 &&
+                Math.abs(c.x - soldier.x) < 260 &&
+                c.x >= safeMinX &&
+                c.x <= safeMaxX &&
+                Math.abs(c.x - cmd.x) >= 90 &&
+                (c.x < leftmostDefX - 30 || c.x > rightmostDefX + 30)
             );
 
             if (nearbyGroundCoin && (!soldier.coinsHeld || soldier.coinsHeld < 10)) {
@@ -3578,10 +4496,24 @@ export class GameEngine {
               if (chosenAnimal) {
                 const distToAnimal = Math.abs(soldier.x - chosenAnimal.x);
                 if (distToAnimal <= huntRange) {
-                  // In range! Halt, take aim, and fire rifle at the wild animal
+                  // In range! Halt, take aim first, and fire rifle at the wild animal
                   soldier.isWalking = false;
                   soldier.facing = chosenAnimal.x > soldier.x ? 1 : -1;
-                  if (soldier.attackCooldown <= 0) {
+
+                  if (soldier.huntAimTargetId !== chosenAnimal.id) {
+                    soldier.huntAimTargetId = chosenAnimal.id;
+                    soldier.huntAimTimer = 0;
+                  }
+
+                  soldier.huntAimTimer = (soldier.huntAimTimer || 0) + dt;
+                  const aimRequired = soldier.role === 'sniper' ? 0.65 : 0.45;
+
+                  if (soldier.huntAimTimer < aimRequired) {
+                    // Visible aiming stance! Arms raise rifle to shoulder, sighting down the barrel
+                    soldier.state = 'aiming';
+                    soldier.weaponState = 'ready_aim';
+                  } else if (soldier.attackCooldown <= 0) {
+                    soldier.huntAimTimer = 0;
                     soldier.attackCooldown = soldier.role === 'sniper' ? 1.6 : 1.15;
                     soldier.muzzleFlashTimer = 0.08;
                     soldier.state = 'shooting';
@@ -4144,18 +5076,6 @@ export class GameEngine {
     const leftOfficer = this.enemies.find((e) => e.type === 'officer' && e.x < hqX && e.health > 0 && e.state !== 'dying');
     const rightOfficer = this.enemies.find((e) => e.type === 'officer' && e.x > hqX && e.health > 0 && e.state !== 'dying');
 
-    // Officer periodic rally whistle / coordinated squad rush
-    if (leftOfficer && Math.random() < 0.008 && isNight) {
-      soundEngine.playWhistle();
-      this.addFloatingText(leftOfficer.x, gY - 45, '📢 Hücum Emri! Siperin Zayıf Noktasına Yüklenin!', '#ef4444');
-      this.spawnDebris(leftOfficer.x, gY - 30, '#ef4444', 6);
-    }
-    if (rightOfficer && Math.random() < 0.008 && isNight) {
-      soundEngine.playWhistle();
-      this.addFloatingText(rightOfficer.x, gY - 45, '📢 Hücum Emri! Zayıf Noktayı Yarın!', '#ef4444');
-      this.spawnDebris(rightOfficer.x, gY - 30, '#ef4444', 6);
-    }
-
     for (const enemy of this.enemies) {
       enemy.y = gY;
 
@@ -4339,8 +5259,16 @@ export class GameEngine {
         if (s.type === 'trench' && s.assignedSoldierIds.length > 0) return true;
         return false;
       });
-      // Ground soldiers in way (not elevated in watchtowers or HQ roof)
-      const soldierInWay = this.soldiers.find((s) => Math.abs(s.x - enemy.x) < 30 && s.y >= gY - 15);
+
+      // Ground soldiers in front (assault squads, garrison, or vanguard)
+      // User: "düşman askeri kalkana doğru koşuyor ve sürekli koşma animasyonunda oluyor onlarda çatışsın taaruz askerleriyle içinden geçmeye çalışmasın"
+      const soldierInFront = this.soldiers.find((s) => {
+        if (s.health <= 0 || s.state === 'dying') return false;
+        if (s.y < gY - 15) return false; // In watchtower or high roof position
+        const dist = Math.abs(s.x - enemy.x);
+        const inFront = (s.x - enemy.x) * enemy.facing >= -25;
+        return dist < 220 && inFront;
+      });
 
       if (obstacle && obstacle.health > 0) {
         // Attack obstacle with dynamic damage feedback & splinter FX
@@ -4395,16 +5323,58 @@ export class GameEngine {
             soundEngine.playExplosion(false);
           }
         }
-      } else if (soldierInWay && soldierInWay.health > 0 && soldierInWay.state !== 'dying') {
-        // Attack Mehmetçik
-        enemy.state = 'charging';
-        if (enemy.attackCooldown <= 0) {
-          enemy.attackCooldown = 0.8;
-          soldierInWay.health -= enemy.damage;
-          soundEngine.playBayonetClash();
-          this.spawnBlood(soldierInWay.x, gY - 20, 3);
-          if (soldierInWay.health <= 0) {
-            this.onSoldierDefeated(soldierInWay);
+      } else if (soldierInFront) {
+        // HALT IMMEDIATELY! Do not run through friendly troops!
+        // Face the soldier and engage in combat until defeated
+        const sDist = Math.abs(soldierInFront.x - enemy.x);
+        enemy.facing = (soldierInFront.x > enemy.x ? 1 : -1) as 1 | -1;
+
+        if (sDist < 42) {
+          // Melee range combat: Bayonet / club / trench spade attack
+          enemy.state = 'bayonet';
+          if (enemy.attackCooldown <= 0) {
+            enemy.attackCooldown = 0.8;
+            let appliedDmg = enemy.damage;
+            if (soldierInFront.isAssaultHeavyArmor) {
+              // Authentic WWI Sappenpanzer heavy steel armor deflects 60% of melee damage!
+              appliedDmg = Math.max(4, Math.round(enemy.damage * 0.4));
+              soundEngine.playBayonetClash();
+              this.spawnDebris(soldierInFront.x, gY - 18, '#94a3b8', 4);
+            } else {
+              soundEngine.playBayonetClash();
+              this.spawnBlood(soldierInFront.x, gY - 20, 3);
+            }
+            soldierInFront.health -= appliedDmg;
+            if (soldierInFront.health <= 0) {
+              this.onSoldierDefeated(soldierInFront);
+            }
+          }
+        } else {
+          // Ranged combat: Stand firm, raise rifle and shoot at soldier!
+          enemy.state = 'shooting';
+          if (enemy.attackCooldown <= 0) {
+            const cooldowns: Record<string, number> = {
+              stormtrooper: 1.1,
+              scout: 1.4,
+              officer: 1.6,
+              highlander: 1.8,
+              grenadier: 2.8,
+              infantry: 1.9,
+            };
+            enemy.attackCooldown = cooldowns[enemy.type] || 1.8;
+            soundEngine.playGunshot(enemy.type === 'stormtrooper');
+            this.spawnProjectile({
+              id: `ebullet_${this.projIdCounter++}`,
+              x: enemy.x + enemy.facing * 16,
+              y: gY - 22,
+              vx: enemy.facing * 710,
+              vy: (Math.random() - 0.5) * 10,
+              type: 'enemy_bullet',
+              damage: enemy.damage || 18,
+              radius: 3.5,
+              source: 'enemy',
+              life: 1.2,
+            });
           }
         }
       } else {
@@ -4429,9 +5399,15 @@ export class GameEngine {
     this.nightWavesSpawnedCount += 1;
     const w = this.state.level.worldWidth;
     const isBloodMoon = this.state.dayNumber % 3 === 0;
-    // Determine spawn flanks (single flank or pincer attack)
+    // Determine spawn flanks (use planned radio wave if decoded/planned, or default formula)
     const sides: ('left' | 'right')[] = [];
-    if (isBloodMoon || Math.random() < 0.35 + this.state.dayNumber * 0.1) {
+    if (this.plannedNightWave) {
+      if (this.plannedNightWave.flank === 'both') {
+        sides.push('left', 'right');
+      } else {
+        sides.push(this.plannedNightWave.flank);
+      }
+    } else if (isBloodMoon || Math.random() < 0.35 + this.state.dayNumber * 0.1) {
       sides.push('left', 'right'); // Pincer assault!
     } else {
       sides.push(Math.random() < 0.5 ? 'left' : 'right');
@@ -4445,10 +5421,12 @@ export class GameEngine {
 
     const bloodMultiplier = isBloodMoon ? 1.35 : 1.0;
     const hpMultiplier = this.state.level.baseEnemyMultiplier * (1 + this.state.dayNumber * 0.35) * bloodMultiplier;
-    // Sequential wave per night: squad size scales continuously with days
-    const squadSize = this.state.dayNumber === 1
-      ? 5
-      : Math.min(20, 5 + Math.floor(this.state.dayNumber * 1.8) + (isBloodMoon ? 5 : 0));
+    // Sequential wave per night: squad size scales continuously with days or matches planned intelligence
+    const squadSize = this.plannedNightWave
+      ? this.plannedNightWave.squadSize
+      : (this.state.dayNumber === 1
+        ? 5
+        : Math.min(20, 5 + Math.floor(this.state.dayNumber * 1.8) + (isBloodMoon ? 5 : 0)));
 
     for (const spawnSide of sides) {
       const camp = this.landingCamps.find((c) => c.side === spawnSide);
@@ -4520,6 +5498,11 @@ export class GameEngine {
           bountyMecidiye: bounty,
         });
       }
+    }
+
+    if (this.plannedNightWave) {
+      // Güvenilir istihbarat: Telsiz ne dediyse tam o kadar ve o kanattan geldi, ilave bilinmeyen dalga çıkmaz!
+      this.nightWavesSpawnedCount = this.maxNightWaves;
     }
   }
 
@@ -4671,15 +5654,16 @@ export class GameEngine {
                   this.spawnDebris(camp.x, gY - 30, '#1e293b', 35);
                   this.spawnDebris(camp.x, gY - 30, '#ea580c', 30);
 
-                  // All participating soldiers return together safely without vanishing
+                  // All participating soldiers return together safely without vanishing or losing armor
                   const hq = this.slots.find((s) => s.id === 'hq_main');
                   const hqX = hq ? hq.x : 2500;
                   for (const sol of this.soldiers) {
                     if (sol.isAssaultSquad && (sol.targetCampId === camp.id || !this.landingCamps.some((c) => !c.isDestroyed))) {
-                      sol.isAssaultSquad = false;
                       sol.targetCampId = null;
                       sol.isReturningFromAssault = true;
+                      sol.isWalking = true;
                       sol.state = 'walking';
+                      sol.weaponState = 'shouldered';
                       sol.facing = sol.x > hqX ? -1 : 1;
                     }
                   }
@@ -4738,15 +5722,16 @@ export class GameEngine {
               this.spawnDebris(camp.x, gY - 30, '#1e293b', 30);
               this.spawnDebris(camp.x, gY - 30, '#ea580c', 25);
 
-              // All participating soldiers return together safely without vanishing
+              // All participating soldiers return together safely without vanishing or losing armor
               const hq = this.slots.find((s) => s.id === 'hq_main');
               const hqX = hq ? hq.x : 2500;
               for (const sol of this.soldiers) {
                 if (sol.isAssaultSquad && (sol.targetCampId === camp.id || !this.landingCamps.some((c) => !c.isDestroyed))) {
-                  sol.isAssaultSquad = false;
                   sol.targetCampId = null;
                   sol.isReturningFromAssault = true;
+                  sol.isWalking = true;
                   sol.state = 'walking';
+                  sol.weaponState = 'shouldered';
                   sol.facing = sol.x > hqX ? -1 : 1;
                 }
               }
@@ -4825,17 +5810,36 @@ export class GameEngine {
           }
 
           if (!wireHit) {
-            // Enemy bullet hitting friendly soldiers
+            // Check heavy armored vanguard first to act as a shield for the squad behind them
+            let hitSoldier: typeof this.soldiers[0] | null = null;
             for (const s of this.soldiers) {
               if (s.state === 'dying' || s.health <= 0) continue;
-              if (Math.abs(s.x - p.x) < 18 && Math.abs(gY - 20 - p.y) < 22) {
-                p.life = 0;
-                s.health -= p.damage;
-                this.spawnBlood(s.x, gY - 20, 2);
-                if (s.health <= 0) {
-                  this.onSoldierDefeated(s);
+              if (Math.abs(s.x - p.x) < 20 && Math.abs(gY - 20 - p.y) < 24) {
+                if (s.isAssaultHeavyArmor) {
+                  hitSoldier = s;
+                  break;
+                } else if (!hitSoldier) {
+                  hitSoldier = s;
                 }
-                break;
+              }
+            }
+
+            if (hitSoldier) {
+              p.life = 0;
+              if (hitSoldier.isAssaultHeavyArmor) {
+                // WWI Heavy Sappenpanzer & ballistic shield deflects 75% of incoming bullet damage!
+                const deflectedDamage = Math.max(2, Math.round(p.damage * 0.25));
+                hitSoldier.health -= deflectedDamage;
+                soundEngine.playRicochet();
+                this.spawnDebris(hitSoldier.x + hitSoldier.facing * 8, gY - 20, '#fef08a', 4);
+                this.spawnDebris(hitSoldier.x + hitSoldier.facing * 8, gY - 20, '#94a3b8', 3);
+              } else {
+                hitSoldier.health -= p.damage;
+                this.spawnBlood(hitSoldier.x, gY - 20, 2);
+              }
+
+              if (hitSoldier.health <= 0) {
+                this.onSoldierDefeated(hitSoldier);
               }
             }
           }
@@ -4843,61 +5847,42 @@ export class GameEngine {
       }
     }
 
-    this.projectiles = this.projectiles.filter((p) => p.life > 0);
+    let projWrite = 0;
+    for (let i = 0; i < this.projectiles.length; i++) {
+      const p = this.projectiles[i];
+      if (p.life > 0) {
+        this.projectiles[projWrite++] = p;
+      }
+    }
+    this.projectiles.length = projWrite;
   }
 
   private updateParticles(dt: number) {
-    for (const pt of this.particles) {
+    // In-place compaction: completely eliminates GC allocations and frame drops
+    let pWrite = 0;
+    for (let i = 0; i < this.particles.length; i++) {
+      const pt = this.particles[i];
       pt.x += pt.vx * dt;
       pt.y += pt.vy * dt;
       pt.life -= dt;
       pt.alpha = pt.life / pt.maxLife;
+      if (pt.life > 0) {
+        this.particles[pWrite++] = pt;
+      }
     }
-    this.particles = this.particles.filter((pt) => pt.life > 0);
+    this.particles.length = pWrite;
 
-    for (const txt of this.floatingTexts) {
+    let tWrite = 0;
+    for (let i = 0; i < this.floatingTexts.length; i++) {
+      const txt = this.floatingTexts[i];
       txt.y -= 25 * dt;
       txt.life -= dt;
       txt.alpha = Math.max(0, txt.life);
-    }
-    this.floatingTexts = this.floatingTexts.filter((t) => t.life > 0);
-
-    // Dynamic Weather Particles (Rain / Snow)
-    if (this.state.weather === 'rain' || this.state.weather === 'storm') {
-      const camX = this.state.cameraX;
-      for (let i = 0; i < 4; i++) {
-        this.particles.push({
-          id: `rain_${Math.random()}`,
-          x: camX + Math.random() * 1200,
-          y: Math.random() * 200,
-          vx: -60,
-          vy: 420,
-          color: '#60a5fa',
-          size: 2,
-          alpha: 0.6,
-          life: 0.8,
-          maxLife: 0.8,
-          type: 'rain',
-        });
-      }
-    } else if (this.state.weather === 'snow') {
-      const camX = this.state.cameraX;
-      for (let i = 0; i < 2; i++) {
-        this.particles.push({
-          id: `snow_${Math.random()}`,
-          x: camX + Math.random() * 1200,
-          y: 0,
-          vx: (Math.random() - 0.5) * 30,
-          vy: 80 + Math.random() * 40,
-          color: '#ffffff',
-          size: 2 + Math.random() * 2,
-          alpha: 0.8,
-          life: 4.0,
-          maxLife: 4.0,
-          type: 'snow',
-        });
+      if (txt.life > 0) {
+        this.floatingTexts[tWrite++] = txt;
       }
     }
+    this.floatingTexts.length = tWrite;
   }
 
   private checkGameConditions() {

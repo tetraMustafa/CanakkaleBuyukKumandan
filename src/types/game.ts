@@ -103,6 +103,7 @@ export interface BuildSlot {
   repairCoinsDeposited?: number; // Coins deposited specifically for building repairs
   availableRifles?: number; // Kingdom armory: 0 to 6 rifles resting on the rifle bench
   maxRifles?: number; // Maximum rifles on the bench (default 6)
+  availableAssaultArmors?: number; // Assault banner armor suits waiting for soldiers to equip
   horseType?: MountType; // 'white' | 'brown' | 'black'
   isHorseTamed?: boolean;
   clearedProgress?: number; // 0 to 1 as felled trees clear out and grass withers
@@ -162,6 +163,9 @@ export interface Soldier {
   coinsHeld?: number;
   isRetinue?: boolean;
   isAssaultSquad?: boolean;
+  isAssaultHeavyArmor?: boolean;
+  assaultOrder?: number;
+  targetEquipSlotId?: string | null;
   assaultSide?: 'left' | 'right';
   targetCampId?: string | null;
   targetTreeId?: string | null;
@@ -172,6 +176,10 @@ export interface Soldier {
   isReturningFromAssault?: boolean;
   defenseFlank?: 'left' | 'right';
   isWalking?: boolean;
+  assaultCoinsDeposited?: number;
+  assaultState?: 'defending' | 'charging'; // Kingdom knight style: defense until ordered with 1 coin
+  huntAimTimer?: number; // Pre-firing rifle aim timer when hunting animals
+  huntAimTargetId?: string | null;
   deathTimer?: number;
   maxDeathTimer?: number;
   deathAnimType?: number; // 0: Forward kneel & fold, 1: Backwards blowback recoil, 2: Sideways stagger roll
@@ -196,7 +204,7 @@ export interface Enemy {
   maxHealth: number;
   speed: number;
   facing: 1 | -1;
-  state: 'marching' | 'shooting' | 'charging' | 'throwing_bomb' | 'dying';
+  state: 'marching' | 'shooting' | 'charging' | 'throwing_bomb' | 'dying' | 'bayonet';
   attackCooldown: number;
   damage: number;
   range: number;
@@ -311,6 +319,45 @@ export interface LevelConfig {
   }[];
 }
 
+export type InGameTutorialStep =
+  | 'goto_hq'
+  | 'collect_coins'
+  | 'buy_rifle'
+  | 'recruit_soldier'
+  | 'chop_tree'
+  | 'build_trench'
+  | 'build_wire'
+  | 'use_whistle'
+  | 'done';
+
+export interface RadioIntelReport {
+  text: string;
+  flank: 'left' | 'right' | 'both';
+  enemyCount: number;
+  hasHeavyUnits: boolean;
+  timestamp: number;
+}
+
+export interface RadioInterceptState {
+  isActive: boolean; // Signals transmitting during dusk/night
+  targetFrequency: number; // e.g. 840 kHz
+  currentFrequency: number; // 400 - 1200 kHz
+  signalStrength: number; // 0 to 1 based on frequency tuning
+  isDecoded: boolean;
+  isOpenUI: boolean; // Field wireless telegraph console modal open
+  intelReport?: RadioIntelReport;
+  morseTimer: number;
+}
+
+export interface InGameTutorialState {
+  enabled: boolean;
+  step: InGameTutorialStep;
+  stepTimer: number;
+  isStepCompleted: boolean;
+  fadeAlpha: number;
+  targetX?: number;
+}
+
 export interface GameState {
   level: LevelConfig;
   dayNumber: number;
@@ -335,6 +382,8 @@ export interface GameState {
   fieldArtilleries?: FieldArtillery[];
   stoneTitleEnabled?: boolean;
   stoneLetters?: StoneLetter[];
+  inGameTutorial?: InGameTutorialState;
+  radioIntercept?: RadioInterceptState;
 }
 
 export interface StoneChunk {

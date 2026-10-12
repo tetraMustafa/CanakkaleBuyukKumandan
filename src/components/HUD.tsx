@@ -32,15 +32,19 @@ interface HUDProps {
   onToggleMute: () => void;
   onToggleSpeed: () => void;
   onTogglePause: () => void;
+  onCycleWeather?: () => void;
+  onCycleSeason?: () => void;
   onOpenCodex: () => void;
   onOpenMap: () => void;
   onOpenHelp?: () => void;
+  onOpenTutorial?: () => void;
   onWhistle: () => void;
   onNavalSupport: () => void;
   onOpenMainMenu?: () => void;
+  onToggleRadio?: () => void;
 }
 
-export const HUD: React.FC<HUDProps> = ({
+export const HUD: React.FC<HUDProps> = React.memo(({
   state,
   commander,
   slots: _slots,
@@ -48,12 +52,16 @@ export const HUD: React.FC<HUDProps> = ({
   onToggleMute,
   onToggleSpeed,
   onTogglePause,
+  onCycleWeather,
+  onCycleSeason,
   onOpenCodex,
   onOpenMap,
   onOpenHelp,
+  onOpenTutorial,
   onWhistle: _onWhistle,
   onNavalSupport: _onNavalSupport,
   onOpenMainMenu,
+  onToggleRadio,
 }) => {
   // Phase labels
   const phaseLabels: Record<string, { label: string; color: string }> = {
@@ -91,21 +99,21 @@ export const HUD: React.FC<HUDProps> = ({
     if (id.includes('statue_damage')) {
       return {
         id,
-        titleTr: '🇹🇷 57. Alay Şüheda Sancağı',
+        titleTr: '🇹🇷 57. Alay & Mustafa Kemal Yadigârı',
         descriptionTr: 'Tüm Mehmetçiklerin mermilerini güçlendirir; düşmana %50 daha fazla hasar verdirir ve izli mermi kazandırır.',
       };
     }
     if (id.includes('statue_health')) {
       return {
         id,
-        titleTr: '🌙 Hilal-i Ahmer Metanet Yadigârı',
+        titleTr: '🌙 Hilal-i Ahmer Şifa Yadigârı',
         descriptionTr: 'Bütün Mehmetçiklerin ve kumandanın azami canını %40 artırır ve yaralarını sarar.',
       };
     }
     if (id.includes('statue_defense')) {
       return {
         id,
-        titleTr: '🏰 Mecidiye Tabyası İstihkâm Yadigârı',
+        titleTr: '🛡️ Çanakkale İstihkâm & Savunma Yadigârı',
         descriptionTr: 'Bütün mevzi, siper ve binaların azami dayanıklılığını %50 artırır ve hasarları onarır.',
       };
     }
@@ -120,16 +128,16 @@ export const HUD: React.FC<HUDProps> = ({
     <div className="absolute inset-0 pointer-events-none flex flex-col justify-between p-2 sm:p-3 select-none">
       {/* Top Header Bar */}
       <div className="flex items-start justify-between gap-2">
-        {/* Left: Kingdom Coin Purse & Commander Vitals */}
-        <div className="flex flex-col gap-1.5 pointer-events-auto">
-          {/* Mecidiye Coins (Gold Pouch) */}
-          <div className="flex items-center gap-2 sm:gap-3 bg-stone-950/90 border border-amber-500/70 px-3 py-1.5 rounded-xl shadow-2xl backdrop-blur-md">
+        {/* Left: Kingdom Coin Purse & Commander Vitals + Whistle Status */}
+        <div className="flex flex-col sm:flex-row items-start sm:items-center gap-2 pointer-events-auto">
+          {/* Mecidiye Coins (Gold Coin Icon) */}
+          <div className="flex items-center gap-2 sm:gap-3 bg-stone-950/95 border border-amber-500/70 px-3 py-1.5 rounded-xl shadow-2xl">
             <div className="relative flex items-center justify-center">
               <PixelCoinPouch amount={commander.mecidiye} maxAmount={commander.maxMecidiye} />
             </div>
             <div className="flex flex-col">
               <span className="text-[9px] sm:text-[10px] uppercase font-bold tracking-wider text-amber-400/90 font-cinzel leading-none">
-                Sikke Kesesi
+                Mecidiye Sikkesi
               </span>
               <div className="flex items-baseline gap-1 mt-0.5">
                 <span className="text-base sm:text-lg font-black text-amber-300 font-pixel drop-shadow">
@@ -140,23 +148,108 @@ export const HUD: React.FC<HUDProps> = ({
                 </span>
               </div>
             </div>
-            {commander.activeBuff && (
-              <span className="ml-1 text-[9px] font-pixel text-amber-300 bg-amber-950/70 border border-amber-600/60 px-1.5 py-0.5 rounded">
-                ⚡{Math.ceil(commander.buffTimer)}s
-              </span>
+          </div>
+
+          {/* Taarruz Düdüğü Durumu (Kompakt Üst Bilgi) */}
+          <div
+            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl border shadow-lg transition-all select-none ${
+              commander.activeBuff
+                ? 'bg-gradient-to-r from-amber-950 via-amber-900 to-amber-950 border-amber-400 ring-1 ring-amber-400/50 shadow-[0_0_15px_rgba(245,158,11,0.35)] animate-pulse text-amber-200'
+                : commander.whistleCooldown > 0
+                ? 'bg-stone-950/90 border-stone-800 text-stone-400'
+                : commander.mecidiye < 3 && (!state.inGameTutorial?.enabled || state.inGameTutorial?.step !== 'use_whistle')
+                ? 'bg-stone-950/90 border-stone-800/80 text-amber-400/80'
+                : 'bg-stone-950/95 border-amber-500/80 text-amber-300 shadow-[0_0_12px_rgba(245,158,11,0.2)]'
+            }`}
+            title={
+              commander.activeBuff
+                ? 'Taarruz Düdüğü Aktif! (+%50 Ateş Hızı & Hücum Morali)'
+                : commander.whistleCooldown > 0
+                ? `Düdük Doluyor: ${Math.ceil(commander.whistleCooldown)} saniye`
+                : commander.mecidiye < 3 && (!state.inGameTutorial?.enabled || state.inGameTutorial?.step !== 'use_whistle')
+                ? 'Taarruz Düdüğü İçin 3 Sikke Gerekir'
+                : 'Taarruz Düdüğü Hazır! [Q] Tuşuna Bas'
+            }
+          >
+            <span className="text-xs shrink-0">📯</span>
+            {commander.activeBuff ? (
+              <div className="flex items-center gap-1.5 font-cinzel text-[10px] font-bold">
+                <span className="text-amber-300">HÜCUM:</span>
+                <span className="font-pixel text-xs text-amber-100 bg-amber-900/60 px-1 py-0.5 rounded border border-amber-500/50">
+                  {Math.ceil(commander.buffTimer)}s
+                </span>
+              </div>
+            ) : commander.whistleCooldown > 0 ? (
+              <div className="flex items-center gap-1.5 font-cinzel text-[10px]">
+                <span className="text-stone-400">DÜDÜK:</span>
+                <span className="font-pixel text-xs text-stone-300">
+                  {Math.ceil(commander.whistleCooldown)}s
+                </span>
+              </div>
+            ) : commander.mecidiye < 3 && (!state.inGameTutorial?.enabled || state.inGameTutorial?.step !== 'use_whistle') ? (
+              <div className="flex items-center gap-1.5 font-cinzel text-[10px]">
+                <span className="text-stone-300 font-semibold">DÜDÜK:</span>
+                <span className="font-pixel text-[10px] text-amber-400 bg-amber-950/50 px-1 py-0.5 rounded border border-amber-600/40">
+                  3🪙 Lazım
+                </span>
+              </div>
+            ) : (
+              <div className="flex items-center gap-1.5 font-cinzel text-[10px] font-bold">
+                <span className="text-amber-300">DÜDÜK HAZIR</span>
+                <kbd className="px-1 py-0.5 rounded bg-stone-900 border border-amber-400/60 text-[9px] font-pixel text-amber-200">
+                  Q
+                </kbd>
+              </div>
             )}
           </div>
+
+          {/* Radio Intercept / Intel Report Button (Sadece akşam ve gece görünür; sabah olunca otomatik kapanır) */}
+          {state.radioIntercept?.isActive && (state.timePhase === 'dusk' || state.timePhase === 'night' || state.timePhase === 'midnight') && (
+            <button
+              onClick={() => onToggleRadio ? onToggleRadio() : undefined}
+              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl border shadow-lg transition-all cursor-pointer select-none active:scale-95 ${
+                state.radioIntercept.isDecoded
+                  ? 'bg-stone-950/95 border-emerald-500/80 text-emerald-300 shadow-[0_0_15px_rgba(16,185,129,0.3)] hover:bg-emerald-950/40'
+                  : 'bg-gradient-to-r from-amber-950/95 via-amber-900/95 to-amber-950/95 border-amber-400 text-amber-200 shadow-[0_0_18px_rgba(245,158,11,0.4)] animate-pulse hover:bg-amber-900'
+              }`}
+              title={
+                state.radioIntercept.isDecoded
+                  ? 'Çözülmüş istihbarat telgrafını aç [T]'
+                  : 'Düşman telsiz sinyali yakalandı! Telsiz masasında çözün [T]'
+              }
+            >
+              <Radio className={`w-3.5 h-3.5 shrink-0 ${state.radioIntercept.isDecoded ? 'text-emerald-400' : 'text-amber-300 animate-spin'}`} />
+              {state.radioIntercept.isDecoded && state.radioIntercept.intelReport ? (
+                <div className="flex items-center gap-1 font-cinzel text-[10px] font-bold">
+                  <span className="text-emerald-400">İSTİHBARAT:</span>
+                  <span className="text-emerald-200">
+                    {state.radioIntercept.intelReport.flank === 'left' ? 'SOL KANAT' : state.radioIntercept.intelReport.flank === 'right' ? 'SAĞ KANAT' : 'HER İKİ KANAT'}
+                  </span>
+                  <span className="font-pixel text-[9px] text-emerald-400 bg-emerald-950 px-1 rounded border border-emerald-800">
+                    {state.radioIntercept.intelReport.enemyCount} Er
+                  </span>
+                </div>
+              ) : (
+                <div className="flex items-center gap-1 font-cinzel text-[10px] font-bold">
+                  <span className="text-amber-300">DÜŞMAN TELSİZİ</span>
+                  <kbd className="px-1 py-0.5 rounded bg-stone-900 border border-amber-400/60 text-[9px] font-pixel text-amber-200">
+                    T
+                  </kbd>
+                </div>
+              )}
+            </button>
+          )}
         </div>
 
         {/* Center: Prominent Day Banner, Season Display, Sun/Moon Clock & HQ Health */}
         <div className="flex flex-col items-center pointer-events-auto">
-          <div className="bg-stone-950/95 border-2 border-amber-500/80 px-3.5 sm:px-5 py-1.5 rounded-2xl shadow-[0_0_25px_rgba(245,158,11,0.25)] flex items-center gap-2.5 sm:gap-4 backdrop-blur-md">
+          <div className="bg-stone-950/95 border-2 border-amber-500/80 px-3.5 sm:px-5 py-1.5 rounded-2xl shadow-[0_0_25px_rgba(245,158,11,0.25)] flex items-center gap-2.5 sm:gap-4">
             {/* Clock Icon Rotate */}
             <div className="relative w-7 h-7 sm:w-8 sm:h-8 rounded-full border-2 border-amber-500/60 flex items-center justify-center bg-stone-900 overflow-hidden shadow-inner">
               {state.dayProgress >= 0.2 && state.dayProgress <= 0.6 ? (
-                <Sun className="w-5 h-5 text-amber-400 animate-spin" style={{ animationDuration: '30s' }} />
+                <Sun className="w-5 h-5 text-amber-400" />
               ) : (
-                <Moon className="w-5 h-5 text-indigo-300 animate-pulse" />
+                <Moon className="w-5 h-5 text-indigo-300" />
               )}
               {/* Radial Progress Needle */}
               <div 
@@ -208,7 +301,7 @@ export const HUD: React.FC<HUDProps> = ({
             {/* Speed Toggle (1x / 2x) */}
             <button
               onClick={onToggleSpeed}
-              className="p-1.5 sm:p-2 bg-stone-900/90 hover:bg-stone-800 border border-stone-700 rounded-lg text-stone-300 hover:text-amber-400 transition shadow active:scale-95"
+              className="p-1.5 sm:p-2 bg-stone-900/90 hover:bg-stone-800 border border-stone-700 rounded-lg text-stone-300 hover:text-amber-400 transition shadow active:scale-95 cursor-pointer"
               title="Oyun Hızı (1x / 2x)"
             >
               <FastForward className={`w-3.5 h-3.5 sm:w-4 sm:h-4 ${state.speedMultiplier > 1 ? 'text-amber-400 font-bold' : ''}`} />
@@ -217,7 +310,7 @@ export const HUD: React.FC<HUDProps> = ({
             {/* Sound Toggle */}
             <button
               onClick={onToggleMute}
-              className="p-1.5 sm:p-2 bg-stone-900/90 hover:bg-stone-800 border border-stone-700 rounded-lg text-stone-300 hover:text-amber-400 transition shadow active:scale-95"
+              className="p-1.5 sm:p-2 bg-stone-900/90 hover:bg-stone-800 border border-stone-700 rounded-lg text-stone-300 hover:text-amber-400 transition shadow active:scale-95 cursor-pointer"
               title="Ses Aç/Kapat"
             >
               {isMuted ? <VolumeX className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-red-400" /> : <Volume2 className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-amber-400" />}
@@ -227,7 +320,7 @@ export const HUD: React.FC<HUDProps> = ({
             {onOpenHelp && (
               <button
                 onClick={onOpenHelp}
-                className="p-1.5 sm:p-2 bg-stone-900/90 hover:bg-stone-800 border border-stone-700 rounded-lg text-stone-300 hover:text-amber-400 transition shadow active:scale-95"
+                className="p-1.5 sm:p-2 bg-stone-900/90 hover:bg-stone-800 border border-stone-700 rounded-lg text-stone-300 hover:text-amber-400 transition shadow active:scale-95 cursor-pointer"
                 title="Nasıl Oynanır? (Kumandan Kılavuzu)"
               >
                 <HelpCircle className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-amber-400" />
@@ -285,7 +378,7 @@ export const HUD: React.FC<HUDProps> = ({
                 {activeRelicDetails.map((relic) => (
                   <div
                     key={relic.id}
-                    className="flex items-center gap-2 bg-stone-950/90 border border-amber-500/60 hover:border-amber-400 px-2 py-1 rounded-lg shadow-lg backdrop-blur-md transition group"
+                    className="flex items-center gap-2 bg-stone-950/95 border border-amber-500/60 hover:border-amber-400 px-2 py-1 rounded-lg shadow-lg transition group"
                   >
                     <div className="p-1 bg-amber-950/80 border border-amber-500/50 rounded flex-shrink-0 text-amber-300">
                       <Award className="w-3.5 h-3.5 text-amber-400" />
@@ -307,4 +400,4 @@ export const HUD: React.FC<HUDProps> = ({
       </div>
     </div>
   );
-};
+});

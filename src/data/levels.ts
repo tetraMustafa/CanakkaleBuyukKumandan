@@ -16,14 +16,14 @@ export const CAMPAIGN_LEVELS: LevelConfig[] = [
     relicsAvailable: [
       {
         id: 'statue_damage_1',
-        titleTr: '🇹🇷 57. Alay Şüheda Sancağı (Taarruz Yadigârı)',
+        titleTr: '🇹🇷 57. Alay & Mustafa Kemal Anıtı (Taarruz Yadigârı)',
         descriptionTr: 'Manevi taarruz azmi: Tüm Mehmetçiklerin mermilerini güçlendirir; düşmana %50 daha fazla hasar verdirir ve izli mermi kazandırır.',
         x: 1400,
       },
       {
         id: 'statue_health_1',
-        titleTr: '🌙 Hilal-i Ahmer Metanet Yadigârı',
-        descriptionTr: 'Şefkat ve metanet: Bütün Mehmetçiklerin ve kumandanın azami canını %40 artırır ve yaralarını sarar.',
+        titleTr: '🌙 Hilal-i Ahmer Şifa Anıtı (Can Yadigârı)',
+        descriptionTr: 'Şefkat ve şifa: Bütün Mehmetçiklerin ve kumandanın azami canını %40 artırır ve yaralarını sarar.',
         x: 10600,
       }
     ]
@@ -43,13 +43,13 @@ export const CAMPAIGN_LEVELS: LevelConfig[] = [
     relicsAvailable: [
       {
         id: 'statue_defense_2',
-        titleTr: '🏰 Mecidiye Tabyası İstihkâm Yadigârı',
+        titleTr: '🛡️ Çanakkale İstihkâm & Savunma Anıtı',
         descriptionTr: 'Sağlam tahkimat: Bütün mevzi, siper ve binaların azami dayanıklılığını %50 artırır ve mevcut hasarları onarır.',
         x: 1600,
       },
       {
         id: 'statue_damage_2',
-        titleTr: '🇹🇷 57. Alay Şüheda Sancağı (Taarruz Yadigârı)',
+        titleTr: '🇹🇷 57. Alay & Mustafa Kemal Anıtı (Taarruz Yadigârı)',
         descriptionTr: 'Manevi taarruz azmi: Tüm Mehmetçiklerin mermilerini güçlendirir; düşmana %50 daha fazla hasar verdirir ve izli mermi kazandırır.',
         x: 12400,
       }
@@ -70,13 +70,13 @@ export const CAMPAIGN_LEVELS: LevelConfig[] = [
     relicsAvailable: [
       {
         id: 'statue_health_3',
-        titleTr: '🌙 Hilal-i Ahmer Metanet Yadigârı',
-        descriptionTr: 'Şefkat ve metanet: Bütün Mehmetçiklerin ve kumandanın azami canını %40 artırır ve yaralarını sarar.',
+        titleTr: '🌙 Hilal-i Ahmer Şifa Anıtı (Can Yadigârı)',
+        descriptionTr: 'Şefkat ve şifa: Bütün Mehmetçiklerin ve kumandanın azami canını %40 artırır ve yaralarını sarar.',
         x: 1800,
       },
       {
         id: 'statue_defense_3',
-        titleTr: '🏰 Mecidiye Tabyası İstihkâm Yadigârı',
+        titleTr: '🛡️ Çanakkale İstihkâm & Savunma Anıtı',
         descriptionTr: 'Sağlam tahkimat: Bütün mevzi, siper ve binaların azami dayanıklılığını %50 artırır ve mevcut hasarları onarır.',
         x: 14200,
       }
@@ -97,13 +97,13 @@ export const CAMPAIGN_LEVELS: LevelConfig[] = [
     relicsAvailable: [
       {
         id: 'statue_damage_4',
-        titleTr: '🇹🇷 57. Alay Şüheda Sancağı (Taarruz Yadigârı)',
+        titleTr: '🇹🇷 57. Alay & Mustafa Kemal Anıtı (Taarruz Yadigârı)',
         descriptionTr: 'Manevi taarruz azmi: Tüm Mehmetçiklerin mermilerini güçlendirir; düşmana %50 daha fazla hasar verdirir ve izli mermi kazandırır.',
         x: 2000,
       },
       {
         id: 'statue_defense_4',
-        titleTr: '🏰 Mecidiye Tabyası İstihkâm Yadigârı',
+        titleTr: '🛡️ Çanakkale İstihkâm & Savunma Anıtı',
         descriptionTr: 'Sağlam tahkimat: Bütün mevzi, siper ve binaların azami dayanıklılığını %50 artırır ve mevcut hasarları onarır.',
         x: 16000,
       }
